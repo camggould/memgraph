@@ -25,13 +25,35 @@ LLM agents need memory that survives sessions, scales beyond a context window, a
 
 ## Install
 
-### `go install` (easiest, works today)
+### One-line install (macOS, Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/camggould/memgraph/main/install.sh | sh
+```
+
+Downloads the latest release from GitHub, verifies the SHA-256 checksum, and installs `memgraph` to `/usr/local/bin` (falling back to `$HOME/.local/bin` if `/usr/local/bin` isn't writable and `sudo` isn't available).
+
+Override defaults via env vars:
+
+```sh
+# Pin to a specific version
+curl -fsSL https://raw.githubusercontent.com/camggould/memgraph/main/install.sh | MEMGRAPH_VERSION=v0.1.0 sh
+
+# Install somewhere else
+curl -fsSL https://raw.githubusercontent.com/camggould/memgraph/main/install.sh | MEMGRAPH_INSTALL_DIR=$HOME/bin sh
+```
+
+### Pre-built binaries (manual)
+
+Tarballs and a `checksums.txt` are on the [Releases page](https://github.com/camggould/memgraph/releases) for darwin/linux on amd64+arm64 and windows/amd64.
+
+### `go install`
 
 ```sh
 go install github.com/camggould/memgraph/cmd/memgraph@latest
 ```
 
-Requires Go 1.25+. The binary will land in `$(go env GOBIN)` (or `$GOPATH/bin`); add that to your `PATH`.
+Requires Go 1.25+. Binary lands in `$(go env GOBIN)` (or `$GOPATH/bin`); add that to your `PATH`.
 
 ### Build from source
 
@@ -49,9 +71,17 @@ GOOS=darwin GOARCH=arm64 go build -o memgraph-darwin-arm64 ./cmd/memgraph
 GOOS=windows GOARCH=amd64 go build -o memgraph-windows-amd64.exe ./cmd/memgraph
 ```
 
-### Pre-built binaries
+### Cutting a new release (maintainers)
 
-Prebuilt releases will appear on the [Releases page](https://github.com/camggould/memgraph/releases) once cut. A `.goreleaser.yaml` config is in the repo; run `goreleaser release --clean` from a maintainer machine with a `GITHUB_TOKEN`.
+The repo ships a `.goreleaser.yaml`. After tagging a new version on `main`:
+
+```sh
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+GITHUB_TOKEN=$(gh auth token) goreleaser release --clean
+```
+
+This produces archives + checksums for all supported targets and publishes them to GitHub Releases. The `install.sh` script picks up the new version automatically.
 
 ## Quickstart
 
