@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,6 +28,7 @@ type nodeOut struct {
 	SupersededBy *string        `json:"superseded_by,omitempty"`
 	IsCurrent    bool           `json:"is_current"`
 	IsStale      bool           `json:"is_stale"`
+	Conflicts    []string       `json:"conflicts,omitempty"`
 }
 
 func toNodeOut(n memgraph.Node, requestedVersion bool) nodeOut {
@@ -47,6 +49,12 @@ func toNodeOut(n memgraph.Node, requestedVersion bool) nodeOut {
 	if n.SupersededBy != nil {
 		s := string(*n.SupersededBy)
 		out.SupersededBy = &s
+	}
+	if len(n.Conflicts) > 0 {
+		out.Conflicts = make([]string, 0, len(n.Conflicts))
+		for _, c := range n.Conflicts {
+			out.Conflicts = append(out.Conflicts, string(c))
+		}
 	}
 	// is_current: a node is current if it has no successor. If the caller
 	// asked for a specific version (requestedVersion=true), the node may be
@@ -202,15 +210,16 @@ type createGraphIn struct {
 }
 
 type putNodeIn struct {
-	GraphID     string         `json:"graph_id"`
-	Kind        string         `json:"kind"`
-	Content     string         `json:"content"`
-	LineageID   string         `json:"lineage_id,omitempty" jsonschema:"omit to start a new lineage"`
-	Summary     string         `json:"summary,omitempty"`
-	Tags        []string       `json:"tags,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
-	FreshnessAt string         `json:"freshness_at,omitempty" jsonschema:"RFC3339"`
-	CreatedBy   string         `json:"created_by,omitempty" jsonschema:"opaque provenance; default \"unknown\""`
+	GraphID        string         `json:"graph_id"`
+	Kind           string         `json:"kind"`
+	Content        string         `json:"content"`
+	LineageID      string         `json:"lineage_id,omitempty" jsonschema:"omit to start a new lineage"`
+	Summary        string         `json:"summary,omitempty"`
+	Tags           []string       `json:"tags,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	FreshnessAt    string         `json:"freshness_at,omitempty" jsonschema:"RFC3339"`
+	CreatedBy      string         `json:"created_by,omitempty" jsonschema:"opaque provenance; default \"unknown\""`
+	BasedOnVersion *int           `json:"based_on_version,omitempty" jsonschema:"optimistic-concurrency hint; the version the writer believed was current. Mismatch under manual conflict policy records a sibling."`
 }
 
 type putEdgeIn struct {
@@ -453,17 +462,31 @@ func (s *Server) handlePutNode(ctx context.Context, _ *sdkmcp.CallToolRequest, i
 		createdBy = "unknown"
 	}
 	n, err := s.store.PutNode(ctx, memgraph.NodeInput{
-		GraphID:     memgraph.GraphID(in.GraphID),
-		LineageID:   memgraph.LineageID(in.LineageID),
-		Kind:        in.Kind,
-		Content:     in.Content,
-		Summary:     in.Summary,
-		Tags:        in.Tags,
-		Metadata:    in.Metadata,
-		FreshnessAt: fresh,
-		CreatedBy:   createdBy,
+		GraphID:        memgraph.GraphID(in.GraphID),
+		LineageID:      memgraph.LineageID(in.LineageID),
+		Kind:           in.Kind,
+		Content:        in.Content,
+		Summary:        in.Summary,
+		Tags:           in.Tags,
+		Metadata:       in.Metadata,
+		FreshnessAt:    fresh,
+		CreatedBy:      createdBy,
+		BasedOnVersion: in.BasedOnVersion,
 	})
 	if err != nil {
+		// Manual conflict is a successful write that flags a conflict. We
+		// still return the node (with Conflicts populated) so the client
+		// can act on it, but mark the result as an error so the surfaces
+		// that check IsError can branch on it.
+		if errors.Is(err, memgraph.ErrConflictManual) {
+			res := &sdkmcp.CallToolResult{
+				IsError: true,
+				Content: []sdkmcp.Content{
+					&sdkmcp.TextContent{Text: err.Error()},
+				},
+			}
+			return res, toNodeOut(n, false), nil
+		}
 		return nil, nodeOut{}, err
 	}
 	return nil, toNodeOut(n, false), nil

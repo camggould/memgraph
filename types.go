@@ -56,6 +56,11 @@ type Node struct {
 	CreatedAt    time.Time
 	CreatedBy    string // opaque provenance; memgraph never interprets
 	SupersededBy *NodeID
+	// Conflicts lists sibling versions of this node that are not superseded
+	// by anyone. Empty in the normal case. Populated when a lineage has
+	// multiple concurrent heads under ConflictPolicyManual; the head with
+	// the highest version is returned with the other heads listed here.
+	Conflicts []NodeID
 }
 
 // NodeInput is the put payload. Omit LineageID to create a new lineage;
@@ -70,6 +75,13 @@ type NodeInput struct {
 	Metadata    map[string]any
 	FreshnessAt *time.Time
 	CreatedBy   string
+	// BasedOnVersion is an optional optimistic-concurrency hint. If nil,
+	// the put follows last-writer-wins semantics: the new version supersedes
+	// whatever the current head is. If non-nil and the current head version
+	// matches *BasedOnVersion, the put is non-conflicting. If non-nil and
+	// the current head is ahead of *BasedOnVersion, the put is a concurrent
+	// write — behavior then depends on the graph's ConflictPolicy.
+	BasedOnVersion *int
 }
 
 // Edge is a directed, typed relationship between two lineages. If ToGraph

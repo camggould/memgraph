@@ -266,6 +266,76 @@ func TestHistoryAndSearch(t *testing.T) {
 	}
 }
 
+func TestPutNode_ManualConflict_BasedOnVersion(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	// Create a graph with manual conflict policy.
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{
+		"name":            "manual",
+		"conflict_policy": "manual",
+	}, &g)
+
+	// Seed v1.
+	var n1 nodeOut
+	callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+		"graph_id": g.ID, "kind": "fact", "content": "v1",
+	}, &n1)
+
+	// Non-conflicting write: based_on_version=1 matches current head.
+	var n2a nodeOut
+	res := callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+		"graph_id":         g.ID,
+		"kind":             "fact",
+		"content":          "v2a",
+		"lineage_id":       n1.LineageID,
+		"based_on_version": 1,
+	}, &n2a)
+	if res.IsError {
+		t.Fatalf("non-conflicting put unexpectedly reported error: %+v", res.Content)
+	}
+	if n2a.Version != 2 || len(n2a.Conflicts) != 0 {
+		t.Fatalf("expected clean v2 with no conflicts: %+v", n2a)
+	}
+
+	// Conflicting write under manual: based_on_version=1 but head is now 2.
+	// We bypass callTool (which fails on IsError) and inspect directly.
+	resp, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_put_node",
+		Arguments: map[string]any{
+			"graph_id":         g.ID,
+			"kind":             "fact",
+			"content":          "v2b",
+			"lineage_id":       n1.LineageID,
+			"based_on_version": 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !resp.IsError {
+		t.Fatalf("expected IsError under manual conflict, got %+v", resp)
+	}
+	if resp.StructuredContent == nil {
+		t.Fatalf("expected StructuredContent with the conflicting node, got nil")
+	}
+	var n2b nodeOut
+	raw, err := json.Marshal(resp.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured: %v", err)
+	}
+	if err := json.Unmarshal(raw, &n2b); err != nil {
+		t.Fatalf("decode node out: %v\nraw=%s", err, raw)
+	}
+	if n2b.ID == "" {
+		t.Fatalf("expected node id on conflict, got %+v", n2b)
+	}
+	if len(n2b.Conflicts) != 1 || n2b.Conflicts[0] != n2a.ID {
+		t.Fatalf("expected Conflicts=[%s], got %v", n2a.ID, n2b.Conflicts)
+	}
+}
+
 func TestResources_GraphAndLineage(t *testing.T) {
 	store := openStore(t)
 	// Seed before connecting so registerResources sees the graph.

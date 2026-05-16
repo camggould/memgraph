@@ -419,6 +419,185 @@ type captureHandler struct {
 func (h *captureHandler) OnNodeWritten(_ context.Context, _ memgraph.Node) { atomic.AddInt32(&h.nodes, 1) }
 func (h *captureHandler) OnEdgeWritten(_ context.Context, _ memgraph.Edge) { atomic.AddInt32(&h.edges, 1) }
 
+func TestManualConflictPolicy(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{
+		Name:           "manual",
+		ConflictPolicy: memgraph.ConflictPolicyManual,
+	})
+
+	// v1 seeds the lineage.
+	v1 := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "v1", CreatedBy: "t",
+	})
+
+	// Two writers both believe v1 is current. First wins cleanly (single
+	// head → matched → supersedes v1). Second sees v1 superseded already
+	// but its BasedOnVersion=1 doesn't match the new head (v2) — conflict.
+	basedOn := 1
+	v2a, err := s.PutNode(ctx, memgraph.NodeInput{
+		GraphID: g.ID, LineageID: v1.LineageID, Kind: "fact",
+		Content: "v2a", CreatedBy: "alice", BasedOnVersion: &basedOn,
+	})
+	if err != nil {
+		t.Fatalf("first concurrent put should succeed: %v", err)
+	}
+	if v2a.Version != 2 || len(v2a.Conflicts) != 0 {
+		t.Fatalf("v2a unexpected: %+v", v2a)
+	}
+	// v2a is the only head right now; v2a.Version=2.
+
+	v2b, err := s.PutNode(ctx, memgraph.NodeInput{
+		GraphID: g.ID, LineageID: v1.LineageID, Kind: "fact",
+		Content: "v2b", CreatedBy: "bob", BasedOnVersion: &basedOn,
+	})
+	if !errors.Is(err, memgraph.ErrConflictManual) {
+		t.Fatalf("second concurrent put under manual should return ErrConflictManual, got %v", err)
+	}
+	if v2b.ID == "" {
+		t.Fatalf("v2b should still be returned: %+v", v2b)
+	}
+	if len(v2b.Conflicts) != 1 || v2b.Conflicts[0] != v2a.ID {
+		t.Fatalf("v2b.Conflicts should be [v2a.ID]: %+v", v2b.Conflicts)
+	}
+
+	// Both v2a and v2b must remain as non-superseded heads.
+	a, err := s.GetNodeByID(ctx, v2a.ID)
+	if err != nil {
+		t.Fatalf("GetNodeByID v2a: %v", err)
+	}
+	if a.SupersededBy != nil {
+		t.Fatalf("v2a should still be a head: %+v", a)
+	}
+	if len(a.Conflicts) != 1 || a.Conflicts[0] != v2b.ID {
+		t.Fatalf("v2a should know about v2b sibling: %+v", a.Conflicts)
+	}
+	b, err := s.GetNodeByID(ctx, v2b.ID)
+	if err != nil {
+		t.Fatalf("GetNodeByID v2b: %v", err)
+	}
+	if b.SupersededBy != nil {
+		t.Fatalf("v2b should still be a head: %+v", b)
+	}
+	if len(b.Conflicts) != 1 || b.Conflicts[0] != v2a.ID {
+		t.Fatalf("v2b should know about v2a sibling: %+v", b.Conflicts)
+	}
+
+	// GetNodeByLineage returns the head with the HIGHEST version, with
+	// Conflicts populated. v2b was written second so its version is one
+	// greater than v2a's; v2b should win the tiebreak.
+	cur, err := s.GetNodeByLineage(ctx, v1.LineageID, memgraph.ReadOpts{})
+	if err != nil {
+		t.Fatalf("GetNodeByLineage: %v", err)
+	}
+	if cur.ID != v2b.ID {
+		t.Fatalf("current should be highest-version head v2b: %+v", cur)
+	}
+	if len(cur.Conflicts) != 1 || cur.Conflicts[0] != v2a.ID {
+		t.Fatalf("current.Conflicts should reference v2a: %+v", cur.Conflicts)
+	}
+
+	// Search must surface BOTH heads when content matches.
+	hits, err := s.Search(ctx, g.ID, memgraph.SearchQuery{Text: "v2a"})
+	if err != nil {
+		t.Fatalf("Search v2a: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Node.ID != v2a.ID {
+		t.Fatalf("expected to find v2a, got %+v", hits)
+	}
+	hits, err = s.Search(ctx, g.ID, memgraph.SearchQuery{Text: "v2b"})
+	if err != nil {
+		t.Fatalf("Search v2b: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Node.ID != v2b.ID {
+		t.Fatalf("expected to find v2b, got %+v", hits)
+	}
+
+	// Resolve: a write with BasedOnVersion matching either sibling should
+	// supersede BOTH siblings. We pass v2a's version (2). The resolution
+	// becomes max(heads.version)+1 = v2b.Version + 1.
+	resolveBase := v2a.Version
+	v3, err := s.PutNode(ctx, memgraph.NodeInput{
+		GraphID: g.ID, LineageID: v1.LineageID, Kind: "fact",
+		Content: "v3 resolution", CreatedBy: "carol", BasedOnVersion: &resolveBase,
+	})
+	if err != nil {
+		t.Fatalf("resolution put should succeed: %v", err)
+	}
+	if v3.Version != v2b.Version+1 || len(v3.Conflicts) != 0 {
+		t.Fatalf("v3 unexpected: %+v", v3)
+	}
+
+	cur, err = s.GetNodeByLineage(ctx, v1.LineageID, memgraph.ReadOpts{})
+	if err != nil {
+		t.Fatalf("GetNodeByLineage after resolve: %v", err)
+	}
+	if cur.ID != v3.ID || len(cur.Conflicts) != 0 {
+		t.Fatalf("after resolve, current should be v3 with no conflicts: %+v", cur)
+	}
+
+	for _, id := range []memgraph.NodeID{v2a.ID, v2b.ID} {
+		got, err := s.GetNodeByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetNodeByID %v: %v", id, err)
+		}
+		if got.SupersededBy == nil || *got.SupersededBy != v3.ID {
+			t.Fatalf("expected %v superseded by v3, got %+v", id, got)
+		}
+	}
+}
+
+func TestLWWUnderConcurrentBasedOn(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{
+		Name:           "lww",
+		ConflictPolicy: memgraph.ConflictPolicyLWW,
+	})
+
+	v1 := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "v1", CreatedBy: "t",
+	})
+
+	basedOn := 1
+	v2a, err := s.PutNode(ctx, memgraph.NodeInput{
+		GraphID: g.ID, LineageID: v1.LineageID, Kind: "fact",
+		Content: "v2a", CreatedBy: "alice", BasedOnVersion: &basedOn,
+	})
+	if err != nil {
+		t.Fatalf("first put: %v", err)
+	}
+	v2b, err := s.PutNode(ctx, memgraph.NodeInput{
+		GraphID: g.ID, LineageID: v1.LineageID, Kind: "fact",
+		Content: "v2b", CreatedBy: "bob", BasedOnVersion: &basedOn,
+	})
+	if err != nil {
+		t.Fatalf("second LWW put should NOT error, got %v", err)
+	}
+	if len(v2b.Conflicts) != 0 {
+		t.Fatalf("LWW should not record conflicts: %+v", v2b.Conflicts)
+	}
+
+	// v2a should now be superseded by v2b.
+	a, err := s.GetNodeByID(ctx, v2a.ID)
+	if err != nil {
+		t.Fatalf("GetNodeByID: %v", err)
+	}
+	if a.SupersededBy == nil || *a.SupersededBy != v2b.ID {
+		t.Fatalf("v2a should be superseded by v2b under LWW: %+v", a)
+	}
+
+	// Exactly one head, no conflicts surfaced.
+	cur, err := s.GetNodeByLineage(ctx, v1.LineageID, memgraph.ReadOpts{})
+	if err != nil {
+		t.Fatalf("GetNodeByLineage: %v", err)
+	}
+	if cur.ID != v2b.ID || len(cur.Conflicts) != 0 {
+		t.Fatalf("LWW current should be v2b with no conflicts: %+v", cur)
+	}
+}
+
 func TestSubscribe(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

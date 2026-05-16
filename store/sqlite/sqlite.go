@@ -336,34 +336,93 @@ func (s *Store) PutNode(ctx context.Context, in memgraph.NodeInput) (memgraph.No
 		}
 	}
 
-	// TODO(manual-conflicts): when ConflictPolicyManual is set, the PRD
-	// expects both concurrent versions to remain and a `conflicts` field
-	// on Node to surface them. Node has no such field today (would need a
-	// types.go change, which is out of scope here). For v1 we fall through
-	// to LWW semantics regardless of policy.
-
 	lineageID := in.LineageID
-	version := 1
-	var prevID memgraph.NodeID
-	hasPrev := false
 
+	// Load all non-superseded heads on this lineage, newest version first.
+	// This drives both version numbering and conflict detection.
+	type head struct {
+		id      memgraph.NodeID
+		version int
+	}
+	var heads []head
 	if lineageID != "" {
-		var prevIDStr string
-		var prevVersion int
-		err := tx.QueryRowContext(ctx,
+		rows, err := tx.QueryContext(ctx,
 			`SELECT id, version FROM nodes
-			  WHERE lineage_id = ? AND superseded_by IS NULL`,
-			string(lineageID)).Scan(&prevIDStr, &prevVersion)
-		if err == nil {
-			prevID = memgraph.NodeID(prevIDStr)
-			hasPrev = true
-			version = prevVersion + 1
-		} else if !errors.Is(err, sql.ErrNoRows) {
+			  WHERE lineage_id = ? AND superseded_by IS NULL
+			  ORDER BY version DESC, id ASC`, string(lineageID))
+		if err != nil {
 			return memgraph.Node{}, err
 		}
-		// If no prev, this lineageID is being seeded externally at v1.
+		for rows.Next() {
+			var idStr string
+			var v int
+			if err := rows.Scan(&idStr, &v); err != nil {
+				rows.Close()
+				return memgraph.Node{}, err
+			}
+			heads = append(heads, head{id: memgraph.NodeID(idStr), version: v})
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return memgraph.Node{}, err
+		}
 	} else {
 		lineageID = memgraph.NewLineageID()
+	}
+
+	// Compute the new version number.
+	version := 1
+	if len(heads) > 0 {
+		version = heads[0].version + 1
+	}
+
+	// Decide which existing heads (if any) to supersede.
+	//
+	//   - BasedOnVersion == nil  : LWW — supersede all current heads.
+	//   - BasedOnVersion matches the single highest head (and there's only
+	//     one head) : non-concurrent; supersede that head.
+	//   - BasedOnVersion matches some head and there are multiple heads
+	//     (i.e. the writer is the resolver) : supersede ALL heads.
+	//   - BasedOnVersion mismatches under manual : supersede none (sibling
+	//     write, conflict recorded).
+	//   - BasedOnVersion mismatches under lww : supersede all heads (LWW
+	//     ignores the hint when it loses; the prior heads still lose).
+	var toSupersede []memgraph.NodeID
+	conflict := false
+	if in.BasedOnVersion == nil {
+		for _, h := range heads {
+			toSupersede = append(toSupersede, h.id)
+		}
+	} else {
+		// Find the head matching BasedOnVersion, if any.
+		matched := false
+		for _, h := range heads {
+			if h.version == *in.BasedOnVersion {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			// Resolver path (or trivial single-head non-conflict).
+			// Supersede every current head so the new version becomes the
+			// unambiguous head.
+			for _, h := range heads {
+				toSupersede = append(toSupersede, h.id)
+			}
+		} else if len(heads) == 0 {
+			// Seeding a new lineage with an unmet hint — treat as fresh write.
+		} else {
+			// Concurrent write.
+			switch g.ConflictPolicy {
+			case memgraph.ConflictPolicyManual:
+				conflict = true
+				// Do not supersede any head; the new version is a sibling.
+			default: // ConflictPolicyLWW or unspecified
+				for _, h := range heads {
+					toSupersede = append(toSupersede, h.id)
+				}
+			}
+		}
 	}
 
 	id := memgraph.NewNodeID()
@@ -389,18 +448,23 @@ func (s *Store) PutNode(ctx context.Context, in memgraph.NodeInput) (memgraph.No
 		return memgraph.Node{}, err
 	}
 
-	// FTS: delete prev current's FTS row, insert new current's FTS row.
-	if hasPrev {
+	// Supersede the resolved set: mark superseded_by and drop their FTS
+	// rows. Heads we leave alone keep their FTS row (so under manual both
+	// siblings remain searchable).
+	for _, sid := range toSupersede {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE nodes SET superseded_by = ? WHERE id = ?`,
-			string(id), string(prevID)); err != nil {
+			string(id), string(sid)); err != nil {
 			return memgraph.Node{}, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM nodes_fts WHERE node_id = ?`, string(prevID)); err != nil {
+			`DELETE FROM nodes_fts WHERE node_id = ?`, string(sid)); err != nil {
 			return memgraph.Node{}, err
 		}
 	}
+
+	// Always insert FTS for the new version: it is a non-superseded head
+	// regardless of whether it stands alone or sits alongside a sibling.
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO nodes_fts(content, summary, tags, node_id) VALUES (?, ?, ?, ?)`,
 		in.Content, in.Summary, ftsTagsString(in.Tags), string(id)); err != nil {
@@ -425,8 +489,47 @@ func (s *Store) PutNode(ctx context.Context, in memgraph.NodeInput) (memgraph.No
 		CreatedAt:   now,
 		CreatedBy:   in.CreatedBy,
 	}
+	if conflict {
+		// Heads that survived (we didn't supersede them) are siblings of
+		// the just-written node. Surface their IDs on the returned Node.
+		for _, h := range heads {
+			node.Conflicts = append(node.Conflicts, h.id)
+		}
+	}
 	s.subs.notifyNode(ctx, node)
+	if conflict {
+		return node, memgraph.ErrConflictManual
+	}
 	return node, nil
+}
+
+// populateConflicts fills Node.Conflicts if n is a current head and other
+// non-superseded heads exist on the same lineage.
+func (s *Store) populateConflicts(ctx context.Context, q querier, n *memgraph.Node) error {
+	if n.SupersededBy != nil {
+		return nil
+	}
+	rows, err := q.QueryContext(ctx,
+		`SELECT id FROM nodes
+		  WHERE lineage_id = ? AND superseded_by IS NULL AND id != ?`,
+		string(n.LineageID), string(n.ID))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var siblings []memgraph.NodeID
+	for rows.Next() {
+		var idStr string
+		if err := rows.Scan(&idStr); err != nil {
+			return err
+		}
+		siblings = append(siblings, memgraph.NodeID(idStr))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	n.Conflicts = siblings
+	return nil
 }
 
 func nullableString(s string) sql.NullString {
@@ -503,27 +606,60 @@ func (s *Store) GetNodeByLineage(ctx context.Context, id memgraph.LineageID, opt
 		row := s.db.QueryRowContext(ctx,
 			`SELECT `+nodeColumns+` FROM nodes WHERE lineage_id = ? AND version = ?`,
 			string(id), *opts.AtVersion)
-		return scanNode(row)
+		n, err := scanNode(row)
+		if err != nil {
+			return memgraph.Node{}, err
+		}
+		if err := s.populateConflicts(ctx, s.db, &n); err != nil {
+			return memgraph.Node{}, err
+		}
+		return n, nil
 	case opts.AtTime != nil:
 		row := s.db.QueryRowContext(ctx,
 			`SELECT `+nodeColumns+` FROM nodes
 			   WHERE lineage_id = ? AND created_at <= ?
 			   ORDER BY version DESC LIMIT 1`,
 			string(id), tsValue(*opts.AtTime))
-		return scanNode(row)
+		n, err := scanNode(row)
+		if err != nil {
+			return memgraph.Node{}, err
+		}
+		if err := s.populateConflicts(ctx, s.db, &n); err != nil {
+			return memgraph.Node{}, err
+		}
+		return n, nil
 	default:
+		// Pick the head with the highest version; tiebreak on id ascending
+		// for determinism when two concurrent siblings happen to share a
+		// version number (which they shouldn't given our +1 scheme, but
+		// the ORDER BY is cheap insurance).
 		row := s.db.QueryRowContext(ctx,
 			`SELECT `+nodeColumns+` FROM nodes
-			   WHERE lineage_id = ? AND superseded_by IS NULL`,
+			   WHERE lineage_id = ? AND superseded_by IS NULL
+			   ORDER BY version DESC, id ASC LIMIT 1`,
 			string(id))
-		return scanNode(row)
+		n, err := scanNode(row)
+		if err != nil {
+			return memgraph.Node{}, err
+		}
+		if err := s.populateConflicts(ctx, s.db, &n); err != nil {
+			return memgraph.Node{}, err
+		}
+		return n, nil
 	}
 }
 
 func (s *Store) GetNodeByID(ctx context.Context, id memgraph.NodeID) (memgraph.Node, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+nodeColumns+` FROM nodes WHERE id = ?`, string(id))
-	return scanNode(row)
+	n, err := scanNode(row)
+	if err != nil {
+		return memgraph.Node{}, err
+	}
+	if err := s.populateConflicts(ctx, s.db, &n); err != nil {
+		return memgraph.Node{}, err
+	}
+	return n, nil
 }
 
 func (s *Store) History(ctx context.Context, id memgraph.LineageID) ([]memgraph.Node, error) {
@@ -542,7 +678,15 @@ func (s *Store) History(ctx context.Context, id memgraph.LineageID) ([]memgraph.
 		}
 		out = append(out, n)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.populateConflicts(ctx, s.db, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) ListNodes(ctx context.Context, graphID memgraph.GraphID, f memgraph.NodeFilter) ([]memgraph.Node, error) {
@@ -584,7 +728,15 @@ func (s *Store) ListNodes(ctx context.Context, graphID memgraph.GraphID, f memgr
 		}
 		out = append(out, n)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.populateConflicts(ctx, s.db, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func placeholders(n int) string {
@@ -892,7 +1044,15 @@ func (s *Store) Search(ctx context.Context, graphID memgraph.GraphID, q memgraph
 		}
 		hits = append(hits, memgraph.SearchHit{Node: n, Snippet: snip, Score: -score})
 	}
-	return hits, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range hits {
+		if err := s.populateConflicts(ctx, s.db, &hits[i].Node); err != nil {
+			return nil, err
+		}
+	}
+	return hits, nil
 }
 
 // --- Symlink manifest ---
