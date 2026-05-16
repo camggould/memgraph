@@ -16,21 +16,21 @@ import (
 //   memgraph://<graph_id>              -> graph summary JSON
 //   memgraph://<graph_id>/<lineage_id> -> current node JSON
 //
-// The SDK requires resources to be added at registration time, so we list
-// graphs at build time and register each one. The lineage form is registered
-// as a resource template — clients can ReadResource any URI that matches.
+// Existing graphs are enumerated once at build time. New graphs that appear
+// after the server starts are picked up via a Store subscription installed
+// here — its OnGraphCreated handler calls AddResource on the SDK server, and
+// the SDK automatically sends notifications/resources/list_changed to
+// connected clients. The returned unsubscribe is stored on Server so Serve
+// can release it on shutdown.
+//
+// The lineage form is registered as a resource template — clients can
+// ReadResource any URI that matches.
 func (s *Server) registerResources(srv *sdkmcp.Server) {
 	// Best-effort: enumerate graphs so clients see them via ListResources.
 	// Failures here shouldn't block server startup.
 	if gs, err := s.store.ListGraphs(context.Background()); err == nil {
 		for _, g := range gs {
-			uri := graphURI(g.ID)
-			srv.AddResource(&sdkmcp.Resource{
-				URI:         uri,
-				Name:        g.Name,
-				Description: "memgraph graph " + string(g.ID),
-				MIMEType:    "application/json",
-			}, s.handleReadResource)
+			s.addGraphResource(srv, g)
 		}
 	}
 	// Lineage URIs are unbounded; expose as a template.
@@ -38,6 +38,35 @@ func (s *Server) registerResources(srv *sdkmcp.Server) {
 		URITemplate: "memgraph://{graph_id}/{lineage_id}",
 		Name:        "memgraph_lineage",
 		Description: "Current version of a lineage, JSON-encoded.",
+		MIMEType:    "application/json",
+	}, s.handleReadResource)
+
+	// Subscribe so graphs created (or updated) post-startup show up in
+	// ListResources without a server restart. AddResource replaces an entry
+	// with the same URI, so UpdateGraphConfig safely refreshes the Name.
+	// The SDK fires notifications/resources/list_changed for us.
+	if unsub, err := s.store.Subscribe(&liveResourceHandler{srv: srv, s: s}); err == nil {
+		s.unsubResources = unsub
+	}
+}
+
+// liveResourceHandler reflects store-side graph creation into the MCP
+// server's resource list. Node and edge writes are no-ops here.
+type liveResourceHandler struct {
+	memgraph.NoopWriteHandler
+	srv *sdkmcp.Server
+	s   *Server
+}
+
+func (h *liveResourceHandler) OnGraphCreated(_ context.Context, g memgraph.Graph) {
+	h.s.addGraphResource(h.srv, g)
+}
+
+func (s *Server) addGraphResource(srv *sdkmcp.Server, g memgraph.Graph) {
+	srv.AddResource(&sdkmcp.Resource{
+		URI:         graphURI(g.ID),
+		Name:        g.Name,
+		Description: "memgraph graph " + string(g.ID),
 		MIMEType:    "application/json",
 	}, s.handleReadResource)
 }

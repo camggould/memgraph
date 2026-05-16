@@ -19,6 +19,10 @@ type Server struct {
 	store memgraph.Store
 	name  string
 	ver   string
+	// unsubResources releases the Store subscription installed by
+	// registerResources so the live-resource handler stops running after
+	// the SDK server shuts down. Set by build via registerResources.
+	unsubResources memgraph.Unsubscribe
 }
 
 // Option configures a Server.
@@ -43,6 +47,12 @@ func New(store memgraph.Store, opts ...Option) *Server {
 // transport closes.
 func (s *Server) Serve(ctx context.Context) error {
 	srv := s.build()
+	defer func() {
+		if s.unsubResources != nil {
+			s.unsubResources()
+			s.unsubResources = nil
+		}
+	}()
 	err := srv.Run(ctx, &sdkmcp.StdioTransport{})
 	// ctx cancellation is a clean shutdown.
 	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {

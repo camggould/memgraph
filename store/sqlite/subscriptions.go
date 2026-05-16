@@ -55,3 +55,15 @@ func (s *subscribers) notifyEdge(ctx context.Context, e memgraph.Edge) {
 		h.OnEdgeWritten(ctx, e)
 	}
 }
+
+func (s *subscribers) notifyGraph(ctx context.Context, g memgraph.Graph) {
+	s.mu.RLock()
+	hs := make([]memgraph.WriteHandler, 0, len(s.handles))
+	for _, h := range s.handles {
+		hs = append(hs, h)
+	}
+	s.mu.RUnlock()
+	for _, h := range hs {
+		h.OnGraphCreated(ctx, g)
+	}
+}

@@ -412,12 +412,16 @@ func TestSymlinkManifest(t *testing.T) {
 }
 
 type captureHandler struct {
-	nodes int32
-	edges int32
+	nodes  int32
+	edges  int32
+	graphs int32
 }
 
 func (h *captureHandler) OnNodeWritten(_ context.Context, _ memgraph.Node) { atomic.AddInt32(&h.nodes, 1) }
 func (h *captureHandler) OnEdgeWritten(_ context.Context, _ memgraph.Edge) { atomic.AddInt32(&h.edges, 1) }
+func (h *captureHandler) OnGraphCreated(_ context.Context, _ memgraph.Graph) {
+	atomic.AddInt32(&h.graphs, 1)
+}
 
 func TestManualConflictPolicy(t *testing.T) {
 	s := openTestStore(t)
@@ -627,5 +631,45 @@ func TestSubscribe(t *testing.T) {
 	_ = mustPutNode(t, s, memgraph.NodeInput{GraphID: g.ID, Kind: "fact", Content: "y", CreatedBy: "t"})
 	if got := atomic.LoadInt32(&h.nodes); got != 1 {
 		t.Fatalf("after unsubscribe expected still 1, got %d", got)
+	}
+}
+
+func TestSubscribe_Graph(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	h := &captureHandler{}
+	unsub, err := s.Subscribe(h)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	t.Cleanup(unsub)
+
+	// CreateGraph fires OnGraphCreated.
+	g, err := s.CreateGraph(ctx, memgraph.GraphInput{Name: "g"})
+	if err != nil {
+		t.Fatalf("CreateGraph: %v", err)
+	}
+	if got := atomic.LoadInt32(&h.graphs); got != 1 {
+		t.Fatalf("expected 1 graph notification after CreateGraph, got %d", got)
+	}
+
+	// UpdateGraphConfig also fires OnGraphCreated (the hook covers any graph
+	// existence/identity change so listeners can refresh state).
+	newName := "renamed"
+	if _, err := s.UpdateGraphConfig(ctx, g.ID, memgraph.GraphConfigPatch{Name: &newName}); err != nil {
+		t.Fatalf("UpdateGraphConfig: %v", err)
+	}
+	if got := atomic.LoadInt32(&h.graphs); got != 2 {
+		t.Fatalf("expected 2 graph notifications after UpdateGraphConfig, got %d", got)
+	}
+
+	// After unsubscribe, no further notifications.
+	unsub()
+	if _, err := s.CreateGraph(ctx, memgraph.GraphInput{Name: "ignored"}); err != nil {
+		t.Fatalf("CreateGraph: %v", err)
+	}
+	if got := atomic.LoadInt32(&h.graphs); got != 2 {
+		t.Fatalf("after unsubscribe expected still 2 graph notifications, got %d", got)
 	}
 }

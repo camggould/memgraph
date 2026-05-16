@@ -159,14 +159,16 @@ func (s *Store) CreateGraph(ctx context.Context, in memgraph.GraphInput) (memgra
 		string(id), in.Name, string(policy), kw, md, tsValue(now)); err != nil {
 		return memgraph.Graph{}, err
 	}
-	return memgraph.Graph{
+	g := memgraph.Graph{
 		ID:             id,
 		Name:           in.Name,
 		ConflictPolicy: policy,
 		KindWhitelist:  in.KindWhitelist,
 		Metadata:       in.Metadata,
 		CreatedAt:      now,
-	}, nil
+	}
+	s.subs.notifyGraph(ctx, g)
+	return g, nil
 }
 
 func (s *Store) GetGraph(ctx context.Context, id memgraph.GraphID) (memgraph.Graph, error) {
@@ -287,6 +289,7 @@ func (s *Store) UpdateGraphConfig(ctx context.Context, id memgraph.GraphID, patc
 	if err := tx.Commit(); err != nil {
 		return memgraph.Graph{}, err
 	}
+	s.subs.notifyGraph(ctx, g)
 	return g, nil
 }
 

@@ -56,12 +56,30 @@ type Store interface {
 	Close() error
 }
 
-// WriteHandler is notified when nodes or edges are written. Used by derived
-// indexes (e.g. the v1.1 vector index).
+// WriteHandler is notified when nodes or edges are written, or when graphs
+// are created or have their configuration updated. Used by derived indexes
+// (e.g. the v1.1 vector index) and by transport adapters that need to keep
+// live state in sync with the store (e.g. the MCP server's resource list).
+//
+// Handlers fire AFTER the underlying write has been committed.
 type WriteHandler interface {
 	OnNodeWritten(ctx context.Context, n Node)
 	OnEdgeWritten(ctx context.Context, e Edge)
+	// OnGraphCreated fires after a graph is created OR has its configuration
+	// updated. Implementations that only care about the existence of a graph
+	// can treat both cases the same way; implementations that care about the
+	// distinction can compare g.CreatedAt against time.Now().
+	OnGraphCreated(ctx context.Context, g Graph)
 }
+
+// NoopWriteHandler embeds zero-value methods for WriteHandler so types that
+// only care about a subset of write events can compose it instead of having
+// to implement every method.
+type NoopWriteHandler struct{}
+
+func (NoopWriteHandler) OnNodeWritten(context.Context, Node)   {}
+func (NoopWriteHandler) OnEdgeWritten(context.Context, Edge)   {}
+func (NoopWriteHandler) OnGraphCreated(context.Context, Graph) {}
 
 // Unsubscribe removes a previously registered WriteHandler.
 type Unsubscribe func()

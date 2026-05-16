@@ -336,6 +336,101 @@ func TestPutNode_ManualConflict_BasedOnVersion(t *testing.T) {
 	}
 }
 
+func TestResources_LiveOnGraphCreate(t *testing.T) {
+	store := openStore(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	s := New(store)
+	srv := s.build()
+	t.Cleanup(func() {
+		if s.unsubResources != nil {
+			s.unsubResources()
+		}
+	})
+
+	t1, t2 := sdkmcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server.Connect: %v", err)
+	}
+
+	// Subscribe to resource-list-changed notifications BEFORE Connect so we
+	// don't race against the post-create notification.
+	notified := make(chan struct{}, 4)
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "test", Version: "0"}, &sdkmcp.ClientOptions{
+		ResourceListChangedHandler: func(context.Context, *sdkmcp.ResourceListChangedRequest) {
+			select {
+			case notified <- struct{}{}:
+			default:
+			}
+		},
+	})
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	// Empty store → no graph resources yet.
+	lr, err := cs.ListResources(ctx, &sdkmcp.ListResourcesParams{})
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	for _, r := range lr.Resources {
+		t.Fatalf("expected no graph resources at startup, got %q", r.URI)
+	}
+
+	// Create a graph via the MCP tool.
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "live"}, &g)
+	if g.ID == "" {
+		t.Fatalf("expected graph id: %+v", g)
+	}
+
+	// Expect a resource-list-changed notification.
+	select {
+	case <-notified:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("did not receive resources/list_changed notification within timeout")
+	}
+
+	// ListResources now includes the new graph.
+	lr2, err := cs.ListResources(ctx, &sdkmcp.ListResourcesParams{})
+	if err != nil {
+		t.Fatalf("ListResources after create: %v", err)
+	}
+	wantURI := "memgraph://" + g.ID
+	found := false
+	for _, r := range lr2.Resources {
+		if r.URI == wantURI {
+			found = true
+			if r.Name != "live" {
+				t.Fatalf("expected resource Name=live, got %q", r.Name)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected resource %q in list; got %+v", wantURI, lr2.Resources)
+	}
+
+	// And the resource is readable, yielding the graph summary JSON.
+	rr, err := cs.ReadResource(ctx, &sdkmcp.ReadResourceParams{URI: wantURI})
+	if err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	if len(rr.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(rr.Contents))
+	}
+	var got graphOut
+	if err := json.Unmarshal([]byte(rr.Contents[0].Text), &got); err != nil {
+		t.Fatalf("decode graph: %v\nraw=%s", err, rr.Contents[0].Text)
+	}
+	if got.ID != g.ID || got.Name != "live" {
+		t.Fatalf("graph summary mismatch: %+v", got)
+	}
+}
+
 func TestResources_GraphAndLineage(t *testing.T) {
 	store := openStore(t)
 	// Seed before connecting so registerResources sees the graph.
