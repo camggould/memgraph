@@ -555,11 +555,12 @@ func (s *Store) ListNodes(ctx context.Context, graphID memgraph.GraphID, f memgr
 			args = append(args, k)
 		}
 	}
-	// Tag filtering: nodes.tags is JSON; match if any of f.Tags is present
-	// as a JSON string element. Cheap, correct for small tag lists.
+	// Tag filtering: nodes.tags is a JSON array; require an exact element
+	// match per requested tag via json_each so substrings can't match
+	// (e.g. "bar" must not match a row tagged "barbecue").
 	for _, t := range f.Tags {
-		q += ` AND tags LIKE ?`
-		args = append(args, "%"+jsonStringNeedle(t)+"%")
+		q += ` AND EXISTS (SELECT 1 FROM json_each(nodes.tags) WHERE value = ?)`
+		args = append(args, t)
 	}
 	q += ` ORDER BY created_at DESC, id DESC`
 	if f.Limit > 0 {
@@ -591,16 +592,6 @@ func placeholders(n int) string {
 		return ""
 	}
 	return strings.Repeat("?,", n-1) + "?"
-}
-
-// jsonStringNeedle returns the substring needle that matches `t` as a JSON
-// array string element. We rely on the marshaled form using standard JSON
-// escaping with double quotes; this misses tags containing weird characters
-// but is correct for typical alphanumeric tags. For perfect correctness use
-// SQLite's json1 functions; deferred for now.
-func jsonStringNeedle(t string) string {
-	b, _ := json.Marshal(t)
-	return string(b)
 }
 
 // --- Edges ---
@@ -835,8 +826,8 @@ func (s *Store) Search(ctx context.Context, graphID memgraph.GraphID, q memgraph
 		}
 	}
 	for _, t := range q.Tags {
-		sqlQ += ` AND n.tags LIKE ?`
-		args = append(args, "%"+jsonStringNeedle(t)+"%")
+		sqlQ += ` AND EXISTS (SELECT 1 FROM json_each(n.tags) WHERE value = ?)`
+		args = append(args, t)
 	}
 	if q.FreshOnly {
 		sqlQ += ` AND (n.freshness_at IS NULL OR n.freshness_at >= ?)`

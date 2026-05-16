@@ -133,9 +133,9 @@ value; NULL/empty/whitespace workspaces fall into a "default" graph).
 The note's links field is promoted to first-class "cites" edges; links
 that cross workspaces become cross-graph symlinks.
 
-NOTE: v1 migration is not idempotent. Running this command twice produces
-two sets of graphs. Idempotent re-migration is a v1.1 concern — for now,
-delete and recreate the target memgraph DB if you need to re-import.`,
+Migration is idempotent: re-running picks up net-new notes/links and
+leaves existing migrated content untouched. Content updates on existing
+notes are NOT detected (planned for v1.2).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			kbPath := args[0]
@@ -173,18 +173,26 @@ delete and recreate the target memgraph DB if you need to re-import.`,
 func printMigrateReport(w interface{ Write(p []byte) (int, error) }, r kbmigrate.Report) {
 	prefix := ""
 	verb := "Migrated"
-	creates := "graphs created"
-	edgeVerb := "edges created"
 	if r.DryRun {
 		prefix = "(dry-run) "
 		verb = "Would migrate"
-		creates = "graphs would create"
-		edgeVerb = "edges would create"
 	}
 	fmt.Fprintf(w, "%s%s kb -> memgraph\n", prefix, verb)
 	fmt.Fprintf(w, "  source: %s\n", r.SourcePath)
 	fmt.Fprintf(w, "  target: %s\n", r.TargetPath)
-	fmt.Fprintf(w, "  %s: %d\n", creates, len(r.Graphs))
+
+	reused := 0
+	for _, g := range r.Graphs {
+		if g.Reused {
+			reused++
+		}
+	}
+	newG := len(r.Graphs) - reused
+	if r.DryRun {
+		fmt.Fprintf(w, "  graphs: %d\n", len(r.Graphs))
+	} else {
+		fmt.Fprintf(w, "  graphs: %d (%d reused, %d new)\n", len(r.Graphs), reused, newG)
+	}
 
 	// Right-pad names for a stable visual column.
 	maxName := 0
@@ -198,9 +206,23 @@ func printMigrateReport(w interface{ Write(p []byte) (int, error) }, r kbmigrate
 		if diff := maxName - len(g.Name); diff > 0 {
 			pad = padding(diff)
 		}
-		fmt.Fprintf(w, "    - %s%s (%d nodes)\n", g.Name, pad, g.NodeCount)
+		switch {
+		case r.DryRun:
+			fmt.Fprintf(w, "    - %s%s (%d nodes)\n", g.Name, pad, g.NodeCount)
+		case g.NodesSkipped == 0:
+			fmt.Fprintf(w, "    - %s%s (%d nodes: %d new)\n",
+				g.Name, pad, g.NodeCount, g.NodesCreated)
+		default:
+			fmt.Fprintf(w, "    - %s%s (%d nodes: %d new, %d existing)\n",
+				g.Name, pad, g.NodeCount, g.NodesCreated, g.NodesSkipped)
+		}
 	}
-	fmt.Fprintf(w, "  %s: %d (cites)\n", edgeVerb, r.EdgesCreated)
+	if r.DryRun {
+		fmt.Fprintf(w, "  edges would create: %d (cites)\n", r.EdgesCreated)
+	} else {
+		fmt.Fprintf(w, "  edges: %d created, %d skipped (already present)\n",
+			r.EdgesCreated, r.EdgesSkipped)
+	}
 	fmt.Fprintf(w, "  skipped links: %d (missing targets)\n", len(r.SkippedLinks))
 }
 

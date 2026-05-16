@@ -293,6 +293,71 @@ func TestSearchCurrentOnly(t *testing.T) {
 	}
 }
 
+func TestTagFilteringExactMatch(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{Name: "g"})
+
+	// "bar" must NOT match a filter for "barb" (substring) or "barbecue".
+	nBar := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "shortlived", Tags: []string{"bar"}, CreatedBy: "t",
+	})
+	nBarbecue := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "smokey", Tags: []string{"barbecue"}, CreatedBy: "t",
+	})
+	// A node carrying both tags to verify intersection AND semantics.
+	nBoth := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "both", Tags: []string{"bar", "barbecue"}, CreatedBy: "t",
+	})
+
+	// Filter tag = "bar" matches only bar-tagged nodes (nBar and nBoth), NOT barbecue-only.
+	got, err := s.ListNodes(ctx, g.ID, memgraph.NodeFilter{Tags: []string{"bar"}})
+	if err != nil {
+		t.Fatalf("ListNodes tag=bar: %v", err)
+	}
+	ids := map[memgraph.NodeID]bool{}
+	for _, n := range got {
+		ids[n.ID] = true
+	}
+	if !ids[nBar.ID] || !ids[nBoth.ID] || ids[nBarbecue.ID] {
+		t.Fatalf("tag=bar substring leak: got ids=%v (want nBar+nBoth; not nBarbecue)", ids)
+	}
+
+	// Filter tag = "barb" matches NOTHING — no exact tag is "barb".
+	got, err = s.ListNodes(ctx, g.ID, memgraph.NodeFilter{Tags: []string{"barb"}})
+	if err != nil {
+		t.Fatalf("ListNodes tag=barb: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("tag=barb should match nothing, got %d nodes", len(got))
+	}
+
+	// Multiple tags = AND: must have both "bar" AND "barbecue".
+	got, err = s.ListNodes(ctx, g.ID, memgraph.NodeFilter{Tags: []string{"bar", "barbecue"}})
+	if err != nil {
+		t.Fatalf("ListNodes tag=bar,barbecue: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != nBoth.ID {
+		t.Fatalf("tag intersection: want only nBoth, got %+v", got)
+	}
+
+	// Search with tag filter respects the same exact-match semantics.
+	hits, err := s.Search(ctx, g.ID, memgraph.SearchQuery{Text: "smokey", Tags: []string{"barb"}})
+	if err != nil {
+		t.Fatalf("Search tag=barb: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("search tag=barb should return 0 hits, got %d", len(hits))
+	}
+	hits, err = s.Search(ctx, g.ID, memgraph.SearchQuery{Text: "smokey", Tags: []string{"barbecue"}})
+	if err != nil {
+		t.Fatalf("Search tag=barbecue: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Node.ID != nBarbecue.ID {
+		t.Fatalf("search tag=barbecue: want 1 hit (nBarbecue), got %+v", hits)
+	}
+}
+
 func TestSymlinkManifest(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

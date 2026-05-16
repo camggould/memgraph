@@ -8,14 +8,27 @@
 // real `cites` edges. Cross-workspace links become cross-graph
 // symlinks.
 //
-// v1 migration is NOT idempotent: running it twice yields two sets
-// of graphs. Idempotent re-migration is a v1.1 concern.
+// Migration is idempotent: re-running Migrate against the same kb
+// source picks up any net-new content and leaves existing nodes /
+// edges untouched. Two mechanisms make this work:
+//
+//   - Stable lineage IDs derived from sha256(workspace, kb_note_id)
+//     so the same kb note always maps to the same memgraph lineage.
+//   - Per-workspace graph identity stored in graph.metadata
+//     (kb_managed=true, kb_workspace=<ws>) so re-runs locate the
+//     existing graph instead of creating a new one.
+//
+// Content updates on existing notes are NOT detected here; that's a
+// v1.2 concern. For v1.1 the rule is: existing lineage → skip.
 package kbmigrate
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -33,6 +46,13 @@ const CreatedBy = "kb-migration"
 // column is NULL, empty, or whitespace-only.
 const defaultWorkspace = "default"
 
+// Graph metadata keys used to identify a graph as kb-managed and to
+// look it up on a subsequent migration run.
+const (
+	mdKeyKBManaged   = "kb_managed"
+	mdKeyKBWorkspace = "kb_workspace"
+)
+
 // Options controls migration behavior.
 type Options struct {
 	// DryRun validates the source and reports what would be migrated
@@ -45,16 +65,23 @@ type Report struct {
 	SourcePath   string
 	TargetPath   string // populated by the caller, not Migrate itself
 	Graphs       []GraphReport
+	NodesCreated int
+	NodesSkipped int
 	EdgesCreated int
+	EdgesSkipped int
 	SkippedLinks []SkippedLink
 	DryRun       bool
 }
 
-// GraphReport describes a single graph that was (or would be) created.
+// GraphReport describes a single graph that was (or would be) created
+// or reused during migration.
 type GraphReport struct {
-	Name      string
-	ID        memgraph.GraphID
-	NodeCount int
+	Name          string
+	ID            memgraph.GraphID
+	NodeCount     int  // total nodes in the graph after the run
+	NodesCreated  int  // nodes inserted by this run
+	NodesSkipped  int  // notes whose lineage already existed
+	Reused        bool // true if an existing kb-managed graph was matched
 }
 
 // SkippedLink records a kb link whose target note was not present in
@@ -79,15 +106,25 @@ type kbNote struct {
 	FilePath  sql.NullString
 }
 
-// nodeRef is the result of inserting a node, keyed by kb note ID in
-// the lookup map.
+// nodeRef is the result of resolving a note to its memgraph identity,
+// keyed by kb note ID in the lookup map.
 type nodeRef struct {
 	LineageID memgraph.LineageID
 	GraphID   memgraph.GraphID
 }
 
+// stableLineageID derives a deterministic memgraph LineageID from the
+// (workspace, kb_note_id) pair. It's a hex prefix of a sha256 — not a
+// real ULID, but a valid LineageID (the type is just a string).
+func stableLineageID(workspace, kbNoteID string) memgraph.LineageID {
+	h := sha256.Sum256([]byte(workspace + "\x00" + kbNoteID))
+	return memgraph.LineageID(hex.EncodeToString(h[:])[:26])
+}
+
 // Migrate reads a kb SQLite database at kbDBPath and writes its
 // contents into store as one graph per distinct workspace.
+// Re-running against the same source is a noop on already-migrated
+// notes; net-new notes/links are added.
 func Migrate(ctx context.Context, kbDBPath string, store memgraph.Store, opts Options) (Report, error) {
 	abs, err := filepath.Abs(kbDBPath)
 	if err != nil {
@@ -115,52 +152,110 @@ func Migrate(ctx context.Context, kbDBPath string, store memgraph.Store, opts Op
 		byWorkspace[ws] = append(byWorkspace[ws], n)
 	}
 
-	// Pass 1: create graphs + nodes, build kb-id → (graph, lineage) map.
+	// In non-dry-run mode, scan existing graphs once so we can match
+	// each workspace to an existing kb-managed graph if present.
+	var existingByWorkspace map[string]memgraph.Graph
+	if !opts.DryRun {
+		existingByWorkspace, err = findKBManagedGraphs(ctx, store)
+		if err != nil {
+			return report, fmt.Errorf("scan existing graphs: %w", err)
+		}
+	}
+
+	// Pass 1: ensure graphs exist, insert nodes for net-new lineages.
 	noteIndex := make(map[string]nodeRef, len(notes))
 	graphs := make([]GraphReport, 0, len(workspaceOrder))
 
 	for _, ws := range workspaceOrder {
 		bucket := byWorkspace[ws]
-		gr := GraphReport{Name: ws, NodeCount: len(bucket)}
+		gr := GraphReport{Name: ws}
 
-		if !opts.DryRun {
-			g, err := store.CreateGraph(ctx, memgraph.GraphInput{Name: ws})
-			if err != nil {
-				return report, fmt.Errorf("create graph %q: %w", ws, err)
-			}
-			gr.ID = g.ID
-
-			for _, note := range bucket {
-				tags, err := parseTags(note.TagsRaw)
-				if err != nil {
-					return report, fmt.Errorf("note %s: parse tags: %w", note.ID, err)
-				}
-				node, err := store.PutNode(ctx, memgraph.NodeInput{
-					GraphID:   g.ID,
-					Kind:      "fact",
-					Content:   note.Body,
-					Summary:   note.Title,
-					Tags:      tags,
-					Metadata:  buildMetadata(note),
-					CreatedBy: CreatedBy,
-				})
-				if err != nil {
-					return report, fmt.Errorf("note %s: put node: %w", note.ID, err)
-				}
-				noteIndex[note.ID] = nodeRef{
-					LineageID: node.LineageID,
-					GraphID:   node.GraphID,
-				}
-			}
-		} else {
+		if opts.DryRun {
 			// Dry run: still validate tags parse cleanly so we surface
-			// errors before pretending to succeed.
+			// errors before pretending to succeed. We don't query the
+			// target so we can't distinguish new vs. existing; report
+			// every note as a would-create.
 			for _, note := range bucket {
 				if _, err := parseTags(note.TagsRaw); err != nil {
 					return report, fmt.Errorf("note %s: parse tags: %w", note.ID, err)
 				}
+				gr.NodesCreated++
 			}
+			gr.NodeCount = len(bucket)
+			graphs = append(graphs, gr)
+			report.NodesCreated += gr.NodesCreated
+			continue
 		}
+
+		// Locate-or-create the workspace's graph.
+		var graphID memgraph.GraphID
+		if existing, ok := existingByWorkspace[ws]; ok {
+			graphID = existing.ID
+			gr.Reused = true
+		} else {
+			g, err := store.CreateGraph(ctx, memgraph.GraphInput{
+				Name: ws,
+				Metadata: map[string]any{
+					mdKeyKBManaged:   true,
+					mdKeyKBWorkspace: ws,
+				},
+			})
+			if err != nil {
+				return report, fmt.Errorf("create graph %q: %w", ws, err)
+			}
+			graphID = g.ID
+		}
+		gr.ID = graphID
+
+		for _, note := range bucket {
+			lineageID := stableLineageID(ws, note.ID)
+
+			// Skip if this lineage is already present.
+			if existing, err := store.GetNodeByLineage(ctx, lineageID, memgraph.ReadOpts{}); err == nil {
+				noteIndex[note.ID] = nodeRef{
+					LineageID: existing.LineageID,
+					GraphID:   existing.GraphID,
+				}
+				gr.NodesSkipped++
+				report.NodesSkipped++
+				continue
+			} else if !errors.Is(err, memgraph.ErrNotFound) {
+				return report, fmt.Errorf("note %s: lookup lineage: %w", note.ID, err)
+			}
+
+			tags, err := parseTags(note.TagsRaw)
+			if err != nil {
+				return report, fmt.Errorf("note %s: parse tags: %w", note.ID, err)
+			}
+			node, err := store.PutNode(ctx, memgraph.NodeInput{
+				GraphID:   graphID,
+				LineageID: lineageID,
+				Kind:      "fact",
+				Content:   note.Body,
+				Summary:   note.Title,
+				Tags:      tags,
+				Metadata:  buildMetadata(note),
+				CreatedBy: CreatedBy,
+			})
+			if err != nil {
+				return report, fmt.Errorf("note %s: put node: %w", note.ID, err)
+			}
+			noteIndex[note.ID] = nodeRef{
+				LineageID: node.LineageID,
+				GraphID:   node.GraphID,
+			}
+			gr.NodesCreated++
+			report.NodesCreated++
+		}
+
+		// NodeCount is the total node count in the graph after this
+		// run (including any pre-existing nodes a previous migration
+		// or other writer created).
+		existing, err := store.ListNodes(ctx, graphID, memgraph.NodeFilter{})
+		if err != nil {
+			return report, fmt.Errorf("graph %q: list nodes: %w", ws, err)
+		}
+		gr.NodeCount = len(existing)
 		graphs = append(graphs, gr)
 	}
 	report.Graphs = graphs
@@ -168,8 +263,9 @@ func Migrate(ctx context.Context, kbDBPath string, store memgraph.Store, opts Op
 	// Pass 2: walk links and create cites edges.
 	//
 	// In dry-run mode we never inserted nodes, so noteIndex is empty;
-	// fall back to a presence set built from the source rows. Both
-	// branches must produce identical Report numbers.
+	// fall back to a presence set built from the source rows. Dry-run
+	// reports every valid link as "would-create" — it doesn't try to
+	// detect which already exist in the target.
 	presence := make(map[string]bool, len(notes))
 	for _, n := range notes {
 		presence[n.ID] = true
@@ -202,6 +298,17 @@ func Migrate(ctx context.Context, kbDBPath string, store memgraph.Store, opts Op
 			if !ok {
 				return report, fmt.Errorf("note %s: missing from index after pass 1", toKBID)
 			}
+
+			// Skip if an equivalent edge already exists.
+			exists, err := edgeExists(ctx, store, from.GraphID, from.LineageID, to.LineageID, "cites")
+			if err != nil {
+				return report, fmt.Errorf("edge %s->%s: lookup: %w", note.ID, toKBID, err)
+			}
+			if exists {
+				report.EdgesSkipped++
+				continue
+			}
+
 			if _, err := store.PutEdge(ctx, memgraph.EdgeInput{
 				GraphID:     from.GraphID,
 				FromLineage: from.LineageID,
@@ -217,6 +324,53 @@ func Migrate(ctx context.Context, kbDBPath string, store memgraph.Store, opts Op
 	}
 
 	return report, nil
+}
+
+// findKBManagedGraphs returns kb-managed graphs in store keyed by
+// their kb workspace name. A graph is kb-managed iff its metadata
+// has kb_managed == true. If two graphs claim the same workspace,
+// the first one found wins (creation order); duplicates are ignored.
+func findKBManagedGraphs(ctx context.Context, store memgraph.Store) (map[string]memgraph.Graph, error) {
+	all, err := store.ListGraphs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]memgraph.Graph{}
+	for _, g := range all {
+		if g.Metadata == nil {
+			continue
+		}
+		managed, _ := g.Metadata[mdKeyKBManaged].(bool)
+		if !managed {
+			continue
+		}
+		ws, _ := g.Metadata[mdKeyKBWorkspace].(string)
+		if ws == "" {
+			continue
+		}
+		if _, exists := out[ws]; exists {
+			continue
+		}
+		out[ws] = g
+	}
+	return out, nil
+}
+
+// edgeExists returns true iff store already has an outgoing edge of
+// kind `kind` from `from` whose ToLineage matches `to`. Edge sets per
+// lineage are small (links per note), so a linear scan is fine.
+func edgeExists(ctx context.Context, store memgraph.Store, graphID memgraph.GraphID,
+	from, to memgraph.LineageID, kind string) (bool, error) {
+	edges, err := store.Outgoing(ctx, from, memgraph.TraverseOpts{EdgeKinds: []string{kind}})
+	if err != nil {
+		return false, err
+	}
+	for _, e := range edges {
+		if e.GraphID == graphID && e.ToLineage == to && e.Kind == kind {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // normalizeWorkspace maps NULL/empty/whitespace workspace values to
@@ -341,4 +495,3 @@ func readKBNotes(ctx context.Context, path string) ([]kbNote, error) {
 	}
 	return out, nil
 }
-

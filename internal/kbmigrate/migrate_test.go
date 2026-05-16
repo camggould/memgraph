@@ -395,6 +395,268 @@ func TestMigrate_DryRunDoesNotWrite(t *testing.T) {
 	}
 }
 
+func TestMigrate_SecondRunIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	kbPath := filepath.Join(dir, "kb.db")
+
+	makeKBDB(t, kbPath, []kbRow{
+		{
+			id: "n1", title: "A", body: "a-body",
+			workspace: nullable("work"),
+			links:     nullable(`["n2"]`),
+			created:   nullable("2026-01-01T00:00:00Z"),
+		},
+		{
+			id: "n2", title: "B", body: "b-body",
+			workspace: nullable("work"),
+			created:   nullable("2026-01-02T00:00:00Z"),
+		},
+		{
+			id: "n3", title: "C", body: "c-body",
+			workspace: nullable("personal"),
+			created:   nullable("2026-01-03T00:00:00Z"),
+		},
+	})
+
+	store, _ := openTarget(t)
+	ctx := context.Background()
+
+	r1, err := kbmigrate.Migrate(ctx, kbPath, store, kbmigrate.Options{})
+	if err != nil {
+		t.Fatalf("first Migrate: %v", err)
+	}
+	if r1.NodesCreated != 3 || r1.NodesSkipped != 0 {
+		t.Fatalf("first run: NodesCreated=%d NodesSkipped=%d, want 3/0", r1.NodesCreated, r1.NodesSkipped)
+	}
+	if r1.EdgesCreated != 1 || r1.EdgesSkipped != 0 {
+		t.Fatalf("first run: EdgesCreated=%d EdgesSkipped=%d, want 1/0", r1.EdgesCreated, r1.EdgesSkipped)
+	}
+	for _, g := range r1.Graphs {
+		if g.Reused {
+			t.Errorf("first run: graph %q marked reused", g.Name)
+		}
+	}
+
+	// Snapshot post-first-run state.
+	graphs1, err := store.ListGraphs(ctx)
+	if err != nil {
+		t.Fatalf("ListGraphs after r1: %v", err)
+	}
+	nodeIDsByGraph := map[memgraph.GraphID][]memgraph.NodeID{}
+	for _, g := range graphs1 {
+		ns, err := store.ListNodes(ctx, g.ID, memgraph.NodeFilter{})
+		if err != nil {
+			t.Fatalf("ListNodes: %v", err)
+		}
+		for _, n := range ns {
+			nodeIDsByGraph[g.ID] = append(nodeIDsByGraph[g.ID], n.ID)
+		}
+	}
+
+	// Second run: same source, same target.
+	r2, err := kbmigrate.Migrate(ctx, kbPath, store, kbmigrate.Options{})
+	if err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if r2.NodesCreated != 0 {
+		t.Errorf("second run NodesCreated = %d, want 0", r2.NodesCreated)
+	}
+	if r2.NodesSkipped != 3 {
+		t.Errorf("second run NodesSkipped = %d, want 3", r2.NodesSkipped)
+	}
+	if r2.EdgesCreated != 0 {
+		t.Errorf("second run EdgesCreated = %d, want 0", r2.EdgesCreated)
+	}
+	if r2.EdgesSkipped != 1 {
+		t.Errorf("second run EdgesSkipped = %d, want 1", r2.EdgesSkipped)
+	}
+	for _, g := range r2.Graphs {
+		if !g.Reused {
+			t.Errorf("second run: graph %q not marked reused", g.Name)
+		}
+	}
+
+	// Same number of graphs in the store (no duplicates).
+	graphs2, err := store.ListGraphs(ctx)
+	if err != nil {
+		t.Fatalf("ListGraphs after r2: %v", err)
+	}
+	if len(graphs2) != len(graphs1) {
+		t.Fatalf("graph count drifted: r1=%d r2=%d", len(graphs1), len(graphs2))
+	}
+
+	// Identical node IDs per graph — nothing was rewritten.
+	for _, g := range graphs2 {
+		ns, err := store.ListNodes(ctx, g.ID, memgraph.NodeFilter{})
+		if err != nil {
+			t.Fatalf("ListNodes: %v", err)
+		}
+		if len(ns) != len(nodeIDsByGraph[g.ID]) {
+			t.Errorf("graph %q node count changed: was %d, now %d",
+				g.Name, len(nodeIDsByGraph[g.ID]), len(ns))
+		}
+		gotIDs := map[memgraph.NodeID]bool{}
+		for _, n := range ns {
+			gotIDs[n.ID] = true
+			if n.Version != 1 {
+				t.Errorf("graph %q node %s: version=%d, want 1 (no new versions on re-migrate)",
+					g.Name, n.ID, n.Version)
+			}
+		}
+		for _, id := range nodeIDsByGraph[g.ID] {
+			if !gotIDs[id] {
+				t.Errorf("graph %q lost node id %s after re-migrate", g.Name, id)
+			}
+		}
+	}
+}
+
+func TestMigrate_AddedNoteOnRemigrate(t *testing.T) {
+	dir := t.TempDir()
+	kbPath := filepath.Join(dir, "kb.db")
+
+	// Initial DB: just n1.
+	makeKBDB(t, kbPath, []kbRow{
+		{
+			id: "n1", title: "A", body: "a",
+			workspace: nullable("work"),
+			created:   nullable("2026-01-01T00:00:00Z"),
+		},
+	})
+
+	store, _ := openTarget(t)
+	ctx := context.Background()
+
+	r1, err := kbmigrate.Migrate(ctx, kbPath, store, kbmigrate.Options{})
+	if err != nil {
+		t.Fatalf("first Migrate: %v", err)
+	}
+	if r1.NodesCreated != 1 {
+		t.Fatalf("first run NodesCreated = %d, want 1", r1.NodesCreated)
+	}
+
+	// Capture n1's node ID so we can prove it isn't rewritten.
+	graphs, _ := store.ListGraphs(ctx)
+	if len(graphs) != 1 {
+		t.Fatalf("graphs after r1 = %d, want 1", len(graphs))
+	}
+	workID := graphs[0].ID
+	ns, _ := store.ListNodes(ctx, workID, memgraph.NodeFilter{})
+	if len(ns) != 1 {
+		t.Fatalf("nodes after r1 = %d, want 1", len(ns))
+	}
+	n1ID := ns[0].ID
+	n1Lineage := ns[0].LineageID
+
+	// Add n2 to the kb source and re-migrate. We need a fresh kb DB
+	// file with both rows, since the test fixture builder doesn't
+	// support inserts after construction.
+	kbPath2 := filepath.Join(dir, "kb2.db")
+	makeKBDB(t, kbPath2, []kbRow{
+		{
+			id: "n1", title: "A", body: "a",
+			workspace: nullable("work"),
+			created:   nullable("2026-01-01T00:00:00Z"),
+		},
+		{
+			id: "n2", title: "B", body: "b",
+			workspace: nullable("work"),
+			links:     nullable(`["n1"]`),
+			created:   nullable("2026-01-02T00:00:00Z"),
+		},
+	})
+
+	r2, err := kbmigrate.Migrate(ctx, kbPath2, store, kbmigrate.Options{})
+	if err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if r2.NodesCreated != 1 || r2.NodesSkipped != 1 {
+		t.Errorf("second run: NodesCreated=%d NodesSkipped=%d, want 1/1",
+			r2.NodesCreated, r2.NodesSkipped)
+	}
+	if r2.EdgesCreated != 1 || r2.EdgesSkipped != 0 {
+		t.Errorf("second run: EdgesCreated=%d EdgesSkipped=%d, want 1/0",
+			r2.EdgesCreated, r2.EdgesSkipped)
+	}
+
+	// Only one graph still.
+	graphs, _ = store.ListGraphs(ctx)
+	if len(graphs) != 1 {
+		t.Fatalf("graphs after r2 = %d, want 1", len(graphs))
+	}
+	if graphs[0].ID != workID {
+		t.Fatalf("graph ID changed: %s -> %s", workID, graphs[0].ID)
+	}
+
+	// n1 is untouched (same NodeID, version 1).
+	got, err := store.GetNodeByLineage(ctx, n1Lineage, memgraph.ReadOpts{})
+	if err != nil {
+		t.Fatalf("GetNodeByLineage(n1): %v", err)
+	}
+	if got.ID != n1ID {
+		t.Errorf("n1 NodeID changed: was %s, now %s", n1ID, got.ID)
+	}
+	if got.Version != 1 {
+		t.Errorf("n1 Version = %d, want 1", got.Version)
+	}
+}
+
+func TestMigrate_StableLineageIDsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	kbPath := filepath.Join(dir, "kb.db")
+
+	makeKBDB(t, kbPath, []kbRow{
+		{
+			id: "n1", title: "A", body: "a",
+			workspace: nullable("work"),
+			created:   nullable("2026-01-01T00:00:00Z"),
+		},
+		{
+			id: "n2", title: "B", body: "b",
+			workspace: nullable("work"),
+			created:   nullable("2026-01-02T00:00:00Z"),
+		},
+	})
+
+	// Migrate into target #1.
+	store1, _ := openTarget(t)
+	ctx := context.Background()
+	if _, err := kbmigrate.Migrate(ctx, kbPath, store1, kbmigrate.Options{}); err != nil {
+		t.Fatalf("Migrate s1: %v", err)
+	}
+	g1s, _ := store1.ListGraphs(ctx)
+	lineage1 := map[string]memgraph.LineageID{}
+	for _, g := range g1s {
+		ns, _ := store1.ListNodes(ctx, g.ID, memgraph.NodeFilter{})
+		for _, n := range ns {
+			lineage1[n.Summary] = n.LineageID
+		}
+	}
+
+	// Migrate the same source into a fresh target #2.
+	store2, _ := openTarget(t)
+	if _, err := kbmigrate.Migrate(ctx, kbPath, store2, kbmigrate.Options{}); err != nil {
+		t.Fatalf("Migrate s2: %v", err)
+	}
+	g2s, _ := store2.ListGraphs(ctx)
+	lineage2 := map[string]memgraph.LineageID{}
+	for _, g := range g2s {
+		ns, _ := store2.ListNodes(ctx, g.ID, memgraph.NodeFilter{})
+		for _, n := range ns {
+			lineage2[n.Summary] = n.LineageID
+		}
+	}
+
+	if len(lineage1) != 2 || len(lineage2) != 2 {
+		t.Fatalf("expected 2 nodes per store; got %d / %d", len(lineage1), len(lineage2))
+	}
+	for k, v := range lineage1 {
+		if lineage2[k] != v {
+			t.Errorf("lineage drift for %q: store1=%s store2=%s", k, v, lineage2[k])
+		}
+	}
+}
+
 func TestMigrate_TagsParsing(t *testing.T) {
 	dir := t.TempDir()
 	kbPath := filepath.Join(dir, "kb.db")
