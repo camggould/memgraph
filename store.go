@@ -1,0 +1,67 @@
+package memgraph
+
+import "context"
+
+// Store is the contract every storage backend must satisfy. memgraph's
+// reference implementations (SQLite, Postgres) live in subpackages of
+// store/. Third parties may implement Store against any backend.
+//
+// All methods are expected to be safe for concurrent use.
+type Store interface {
+	// --- Graphs ---
+
+	CreateGraph(ctx context.Context, in GraphInput) (Graph, error)
+	GetGraph(ctx context.Context, id GraphID) (Graph, error)
+	ListGraphs(ctx context.Context) ([]Graph, error)
+	UpdateGraphConfig(ctx context.Context, id GraphID, patch GraphConfigPatch) (Graph, error)
+
+	// --- Nodes (versioned) ---
+
+	// PutNode writes a new version. If in.LineageID is empty, a new lineage
+	// is started at version 1. Otherwise, the lineage gains a new version.
+	PutNode(ctx context.Context, in NodeInput) (Node, error)
+
+	// GetNodeByLineage returns the current version of a lineage by default.
+	// ReadOpts may pin to a specific version or point-in-time.
+	GetNodeByLineage(ctx context.Context, id LineageID, opts ReadOpts) (Node, error)
+
+	// GetNodeByID returns a specific node version exactly as written.
+	GetNodeByID(ctx context.Context, id NodeID) (Node, error)
+
+	// History returns all versions of a lineage, newest first.
+	History(ctx context.Context, id LineageID) ([]Node, error)
+
+	// ListNodes is a low-cardinality enumeration; for ranked/scored queries
+	// use Search.
+	ListNodes(ctx context.Context, graphID GraphID, f NodeFilter) ([]Node, error)
+
+	// --- Edges ---
+
+	PutEdge(ctx context.Context, in EdgeInput) (Edge, error)
+	DeleteEdge(ctx context.Context, id EdgeID) error
+	Outgoing(ctx context.Context, from LineageID, opts TraverseOpts) ([]Edge, error)
+	Incoming(ctx context.Context, to LineageID, opts TraverseOpts) ([]Edge, error)
+	Traverse(ctx context.Context, from LineageID, opts TraverseOpts) (TraversalResult, error)
+
+	// --- Indexes ---
+
+	Search(ctx context.Context, graphID GraphID, q SearchQuery) ([]SearchHit, error)
+	SymlinkManifest(ctx context.Context, graphID GraphID) (SymlinkManifest, error)
+
+	// --- Hooks (for derived indexes; v1.1 vector index uses this) ---
+
+	Subscribe(h WriteHandler) (Unsubscribe, error)
+
+	// Close releases any resources held by the store.
+	Close() error
+}
+
+// WriteHandler is notified when nodes or edges are written. Used by derived
+// indexes (e.g. the v1.1 vector index).
+type WriteHandler interface {
+	OnNodeWritten(ctx context.Context, n Node)
+	OnEdgeWritten(ctx context.Context, e Edge)
+}
+
+// Unsubscribe removes a previously registered WriteHandler.
+type Unsubscribe func()
