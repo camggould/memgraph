@@ -1,36 +1,61 @@
 // Package mcp exposes a memgraph.Store as a Model Context Protocol server.
 //
-// The MCP tool surface mirrors §8 of PRD.md: read tools (list_graphs,
-// get_node, history, traverse, search, symlink_manifest) and write tools
-// (create_graph, put_node, put_edge, delete_edge).
-//
-// TODO(v1): wire up the chosen Go MCP SDK (official modelcontextprotocol/go-sdk
-// vs. mark3labs/mcp-go — decided during scaffolding).
+// Tool surface mirrors §8 of PRD.md: read tools (list_graphs, get_node,
+// history, traverse, search, symlink_manifest) and write tools (create_graph,
+// put_node, put_edge, delete_edge). Graphs and lineages are also exposed as
+// MCP resources under the memgraph:// scheme.
 package mcp
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
 	memgraph "github.com/camggould/memgraph"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Server adapts a memgraph.Store to the MCP transport. Constructed with the
-// Store to expose; lifecycle is managed by the caller (typically the CLI's
-// `memgraph serve` command).
+// Server adapts a memgraph.Store to the MCP transport.
 type Server struct {
 	store memgraph.Store
+	name  string
+	ver   string
 }
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithName overrides the MCP server name advertised to clients.
+func WithName(name string) Option { return func(s *Server) { s.name = name } }
+
+// WithVersion overrides the MCP server version advertised to clients.
+func WithVersion(version string) Option { return func(s *Server) { s.ver = version } }
 
 // New returns a new MCP server bound to the given store.
-func New(store memgraph.Store) *Server {
-	return &Server{store: store}
+func New(store memgraph.Store, opts ...Option) *Server {
+	s := &Server{store: store, name: "memgraph", ver: "0.1.0"}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
-// Serve starts the MCP server on stdio. Blocks until ctx is cancelled or the
+// Serve runs the MCP server on stdio. Blocks until ctx is cancelled or the
 // transport closes.
-//
-// TODO(v1): implement using the chosen MCP SDK.
 func (s *Server) Serve(ctx context.Context) error {
-	return fmt.Errorf("memgraph/mcp: %w", memgraph.ErrNotImplemented)
+	srv := s.build()
+	err := srv.Run(ctx, &sdkmcp.StdioTransport{})
+	// ctx cancellation is a clean shutdown.
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return nil
+	}
+	return err
+}
+
+// build constructs and registers tools/resources on a fresh SDK server. Split
+// out so tests can connect via an in-memory transport.
+func (s *Server) build() *sdkmcp.Server {
+	srv := sdkmcp.NewServer(&sdkmcp.Implementation{Name: s.name, Version: s.ver}, nil)
+	s.registerTools(srv)
+	s.registerResources(srv)
+	return srv
 }
