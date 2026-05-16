@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
 	memgraph "github.com/camggould/memgraph"
+	"github.com/camggould/memgraph/internal/kbmigrate"
 	"github.com/camggould/memgraph/mcp"
 	"github.com/camggould/memgraph/store/sqlite"
 )
@@ -110,15 +112,107 @@ func newMigrateCmd() *cobra.Command {
 		Use:   "migrate",
 		Short: "Migrate data from other systems into memgraph",
 	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "kb [path]",
-		Short: "Import a camggould/kb SQLite database into a new graph",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return fmt.Errorf("migrate kb: %w", memgraph.ErrNotImplemented)
-		},
-	})
+	cmd.AddCommand(newMigrateKBCmd())
 	return cmd
+}
+
+func newMigrateKBCmd() *cobra.Command {
+	var (
+		sqlitePath string
+		dryRun     bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "kb <kb-db-path>",
+		Short: "Import a camggould/kb SQLite database into memgraph",
+		Long: `Import a camggould/kb SQLite database into memgraph.
+
+Each kb note becomes a memgraph node with kind="fact" (content = body,
+summary = title). kb workspaces become memgraph graphs (one per distinct
+value; NULL/empty/whitespace workspaces fall into a "default" graph).
+The note's links field is promoted to first-class "cites" edges; links
+that cross workspaces become cross-graph symlinks.
+
+NOTE: v1 migration is not idempotent. Running this command twice produces
+two sets of graphs. Idempotent re-migration is a v1.1 concern — for now,
+delete and recreate the target memgraph DB if you need to re-import.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			kbPath := args[0]
+
+			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+
+			store, err := openSqlite(sqlitePath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			report, err := kbmigrate.Migrate(ctx, kbPath, store, kbmigrate.Options{
+				DryRun: dryRun,
+			})
+			if err != nil {
+				return fmt.Errorf("migrate kb: %w", err)
+			}
+			absTarget, absErr := filepath.Abs(sqlitePath)
+			if absErr != nil {
+				absTarget = sqlitePath
+			}
+			report.TargetPath = absTarget
+
+			printMigrateReport(cmd.OutOrStdout(), report)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&sqlitePath, "sqlite", "memgraph.db", "Path to target memgraph SQLite store")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Validate source and report what would be migrated without writing")
+	return cmd
+}
+
+func printMigrateReport(w interface{ Write(p []byte) (int, error) }, r kbmigrate.Report) {
+	prefix := ""
+	verb := "Migrated"
+	creates := "graphs created"
+	edgeVerb := "edges created"
+	if r.DryRun {
+		prefix = "(dry-run) "
+		verb = "Would migrate"
+		creates = "graphs would create"
+		edgeVerb = "edges would create"
+	}
+	fmt.Fprintf(w, "%s%s kb -> memgraph\n", prefix, verb)
+	fmt.Fprintf(w, "  source: %s\n", r.SourcePath)
+	fmt.Fprintf(w, "  target: %s\n", r.TargetPath)
+	fmt.Fprintf(w, "  %s: %d\n", creates, len(r.Graphs))
+
+	// Right-pad names for a stable visual column.
+	maxName := 0
+	for _, g := range r.Graphs {
+		if len(g.Name) > maxName {
+			maxName = len(g.Name)
+		}
+	}
+	for _, g := range r.Graphs {
+		pad := ""
+		if diff := maxName - len(g.Name); diff > 0 {
+			pad = padding(diff)
+		}
+		fmt.Fprintf(w, "    - %s%s (%d nodes)\n", g.Name, pad, g.NodeCount)
+	}
+	fmt.Fprintf(w, "  %s: %d (cites)\n", edgeVerb, r.EdgesCreated)
+	fmt.Fprintf(w, "  skipped links: %d (missing targets)\n", len(r.SkippedLinks))
+}
+
+func padding(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = ' '
+	}
+	return string(b)
 }
 
 // --- helpers ---
