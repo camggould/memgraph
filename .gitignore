@@ -1,0 +1,25 @@
+# Binaries
+/memgraph
+/bin/
+/dist/
+
+# Test / coverage
+*.test
+*.out
+coverage.txt
+
+# Local SQLite stores
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.local
