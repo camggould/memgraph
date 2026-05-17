@@ -218,6 +218,16 @@ Search is graph-scoped. Cross-graph search means parallel queries, then merge.
 
 Traverse is breadth-first; bound it with `max_depth` (default 2) and `max_nodes` (default 50) to keep context manageable.
 
+**Direction matters.** As of memgraph v0.2, `memgraph_traverse` takes a `direction` parameter:
+
+| `direction` | Walks | Use for |
+|---|---|---|
+| `outgoing` (default) | from-→to edges only | "What does this node cite / depend on / contain?" |
+| `incoming` | to-→from edges only (backlinks) | "Who cites / depends on / mentions this node?" |
+| `both` | edges in either direction | "Is this node connected to anything?" / ego-graph audits |
+
+Most natural questions are outgoing-shaped. Use `incoming` for backlinks. Use `both` for connectivity audits or undirected ego graphs.
+
 ### Use `memgraph_get_node` when
 
 - You have an exact lineage_id and want the full payload
