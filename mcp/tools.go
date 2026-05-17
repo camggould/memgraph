@@ -172,6 +172,7 @@ type traverseIn struct {
 	EdgeKinds      []string `json:"edge_kinds,omitempty"`
 	FollowSymlinks bool     `json:"follow_symlinks,omitempty"`
 	MaxNodes       int      `json:"max_nodes,omitempty" jsonschema:"output budget; default 50"`
+	Direction      string   `json:"direction,omitempty" jsonschema:"one of: outgoing (default), incoming, both"`
 }
 
 type traverseOut struct {
@@ -261,7 +262,7 @@ func (s *Server) registerTools(srv *sdkmcp.Server) {
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name:        "memgraph_traverse",
-		Description: "Walk edges from a lineage. Default depth 2, max 50 nodes.",
+		Description: "Walk edges from a lineage. Default depth 2, max 50 nodes. Default direction is outgoing; use direction='incoming' for backlinks or 'both' for undirected reachability.",
 	}, s.handleTraverse)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
@@ -369,11 +370,19 @@ func (s *Server) handleTraverse(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 	if maxN <= 0 {
 		maxN = 50
 	}
+	dir := memgraph.TraverseDirection(in.Direction)
+	switch dir {
+	case "", memgraph.TraverseOutgoing, memgraph.TraverseIncoming, memgraph.TraverseBoth:
+		// ok
+	default:
+		return nil, traverseOut{}, fmt.Errorf("%w: direction must be one of outgoing, incoming, both", memgraph.ErrInvalidInput)
+	}
 	res, err := s.store.Traverse(ctx, memgraph.LineageID(in.FromLineage), memgraph.TraverseOpts{
 		MaxDepth:       depth,
 		EdgeKinds:      in.EdgeKinds,
 		FollowSymlinks: in.FollowSymlinks,
 		MaxNodes:       maxN,
+		Direction:      dir,
 	})
 	if err != nil {
 		return nil, traverseOut{}, err

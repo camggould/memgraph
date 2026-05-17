@@ -332,6 +332,108 @@ func TestEdgesAndTraverse(t *testing.T) {
 	}
 }
 
+// buildChainABC creates A->B->C in a fresh graph plus a disconnected D.
+func buildChainABC(t *testing.T, s *postgres.Store) (memgraph.Node, memgraph.Node, memgraph.Node, memgraph.Node) {
+	t.Helper()
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{Name: "chain"})
+	a := mustPutNode(t, s, memgraph.NodeInput{GraphID: g.ID, Kind: "fact", Content: "a", CreatedBy: "t"})
+	b := mustPutNode(t, s, memgraph.NodeInput{GraphID: g.ID, Kind: "fact", Content: "b", CreatedBy: "t"})
+	c := mustPutNode(t, s, memgraph.NodeInput{GraphID: g.ID, Kind: "fact", Content: "c", CreatedBy: "t"})
+	d := mustPutNode(t, s, memgraph.NodeInput{GraphID: g.ID, Kind: "fact", Content: "d", CreatedBy: "t"})
+	if _, err := s.PutEdge(ctx, memgraph.EdgeInput{
+		GraphID: g.ID, FromLineage: a.LineageID, ToLineage: b.LineageID, Kind: "cites", CreatedBy: "t",
+	}); err != nil {
+		t.Fatalf("PutEdge a->b: %v", err)
+	}
+	if _, err := s.PutEdge(ctx, memgraph.EdgeInput{
+		GraphID: g.ID, FromLineage: b.LineageID, ToLineage: c.LineageID, Kind: "cites", CreatedBy: "t",
+	}); err != nil {
+		t.Fatalf("PutEdge b->c: %v", err)
+	}
+	return a, b, c, d
+}
+
+func TestTraverse_DirectionIncoming(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	a, b, c, d := buildChainABC(t, s)
+
+	tr, err := s.Traverse(ctx, c.LineageID, memgraph.TraverseOpts{
+		MaxDepth:  3,
+		Direction: memgraph.TraverseIncoming,
+	})
+	if err != nil {
+		t.Fatalf("Traverse: %v", err)
+	}
+	seen := map[memgraph.LineageID]bool{}
+	for _, n := range tr.Nodes {
+		seen[n.LineageID] = true
+	}
+	if !seen[a.LineageID] || !seen[b.LineageID] || !seen[c.LineageID] {
+		t.Fatalf("incoming traverse from c should reach a, b, c: %v", seen)
+	}
+	if seen[d.LineageID] {
+		t.Fatalf("incoming traverse must not reach disconnected d: %v", seen)
+	}
+	if len(tr.Edges) != 2 {
+		t.Fatalf("expected 2 edges, got %d", len(tr.Edges))
+	}
+}
+
+func TestTraverse_DirectionBoth(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	a, b, c, d := buildChainABC(t, s)
+
+	tr, err := s.Traverse(ctx, b.LineageID, memgraph.TraverseOpts{
+		MaxDepth:  3,
+		Direction: memgraph.TraverseBoth,
+	})
+	if err != nil {
+		t.Fatalf("Traverse: %v", err)
+	}
+	seen := map[memgraph.LineageID]bool{}
+	for _, n := range tr.Nodes {
+		seen[n.LineageID] = true
+	}
+	if !seen[a.LineageID] || !seen[b.LineageID] || !seen[c.LineageID] {
+		t.Fatalf("both traverse from b should reach a, b, c: %v", seen)
+	}
+	if seen[d.LineageID] {
+		t.Fatalf("both traverse must not reach disconnected d: %v", seen)
+	}
+	if len(tr.Edges) != 2 {
+		t.Fatalf("expected 2 deduped edges, got %d", len(tr.Edges))
+	}
+}
+
+func TestTraverse_DefaultIsOutgoing(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	a, b, c, _ := buildChainABC(t, s)
+
+	tr, err := s.Traverse(ctx, a.LineageID, memgraph.TraverseOpts{MaxDepth: 3})
+	if err != nil {
+		t.Fatalf("Traverse: %v", err)
+	}
+	seen := map[memgraph.LineageID]bool{}
+	for _, n := range tr.Nodes {
+		seen[n.LineageID] = true
+	}
+	if !seen[a.LineageID] || !seen[b.LineageID] || !seen[c.LineageID] {
+		t.Fatalf("default direction (outgoing) from a should reach a, b, c: %v", seen)
+	}
+
+	tr2, err := s.Traverse(ctx, c.LineageID, memgraph.TraverseOpts{MaxDepth: 3})
+	if err != nil {
+		t.Fatalf("Traverse: %v", err)
+	}
+	if len(tr2.Nodes) != 1 || tr2.Nodes[0].LineageID != c.LineageID {
+		t.Fatalf("default direction from c should only reach c: %+v", tr2.Nodes)
+	}
+}
+
 func TestSearchCurrentOnly(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

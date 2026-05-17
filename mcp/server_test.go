@@ -227,6 +227,91 @@ func TestEdgeFlow_PutTraverseDelete(t *testing.T) {
 	}
 }
 
+func TestMCP_Traverse_Direction(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	mkNode := func(content string) nodeOut {
+		var n nodeOut
+		callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+			"graph_id": g.ID, "kind": "fact", "content": content,
+		}, &n)
+		return n
+	}
+	a := mkNode("a")
+	b := mkNode("b")
+	c := mkNode("c")
+
+	// a -cites-> b -cites-> c
+	var e1, e2 edgeOut
+	callTool(t, cs, ctx, "memgraph_put_edge", map[string]any{
+		"graph_id":     g.ID,
+		"from_lineage": a.LineageID,
+		"to_lineage":   b.LineageID,
+		"kind":         "cites",
+	}, &e1)
+	callTool(t, cs, ctx, "memgraph_put_edge", map[string]any{
+		"graph_id":     g.ID,
+		"from_lineage": b.LineageID,
+		"to_lineage":   c.LineageID,
+		"kind":         "cites",
+	}, &e2)
+
+	// Incoming from c reaches a and b (and c as the seed).
+	var trIn traverseOut
+	callTool(t, cs, ctx, "memgraph_traverse", map[string]any{
+		"from_lineage": c.LineageID,
+		"direction":    "incoming",
+		"max_depth":    3,
+	}, &trIn)
+	seenIn := map[string]bool{}
+	for _, n := range trIn.Nodes {
+		seenIn[n.LineageID] = true
+	}
+	if !seenIn[a.LineageID] || !seenIn[b.LineageID] || !seenIn[c.LineageID] {
+		t.Fatalf("incoming should reach a, b, c: %+v", trIn.Nodes)
+	}
+	if len(trIn.Edges) != 2 {
+		t.Fatalf("incoming should return 2 edges, got %d: %+v", len(trIn.Edges), trIn.Edges)
+	}
+
+	// Both from b reaches a, b, c.
+	var trBoth traverseOut
+	callTool(t, cs, ctx, "memgraph_traverse", map[string]any{
+		"from_lineage": b.LineageID,
+		"direction":    "both",
+		"max_depth":    3,
+	}, &trBoth)
+	seenBoth := map[string]bool{}
+	for _, n := range trBoth.Nodes {
+		seenBoth[n.LineageID] = true
+	}
+	if !seenBoth[a.LineageID] || !seenBoth[b.LineageID] || !seenBoth[c.LineageID] {
+		t.Fatalf("both should reach a, b, c: %+v", trBoth.Nodes)
+	}
+	if len(trBoth.Edges) != 2 {
+		t.Fatalf("both should return 2 deduped edges, got %d", len(trBoth.Edges))
+	}
+
+	// Invalid direction is rejected.
+	res, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_traverse",
+		Arguments: map[string]any{
+			"from_lineage": a.LineageID,
+			"direction":    "sideways",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected IsError for invalid direction")
+	}
+}
+
 func TestHistoryAndSearch(t *testing.T) {
 	store := openStore(t)
 	cs, ctx := connect(t, store)

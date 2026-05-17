@@ -126,6 +126,16 @@ type NodeFilter struct {
 	Offset int
 }
 
+// TraverseDirection controls which way edges are followed during a traversal.
+// "" defaults to outgoing for backward compatibility.
+type TraverseDirection string
+
+const (
+	TraverseOutgoing TraverseDirection = "outgoing"
+	TraverseIncoming TraverseDirection = "incoming"
+	TraverseBoth     TraverseDirection = "both"
+)
+
 // TraverseOpts controls edge walks. FollowSymlinks is opt-in — by default
 // traversal stops at graph boundaries.
 type TraverseOpts struct {
@@ -133,6 +143,9 @@ type TraverseOpts struct {
 	EdgeKinds      []string
 	FollowSymlinks bool
 	MaxNodes       int
+	// Direction controls which edges are followed. Default ("" or
+	// TraverseOutgoing) is outgoing-only — backward-compatible with v0.1.
+	Direction TraverseDirection
 }
 
 // TraversalResult is the materialized output of a traversal.

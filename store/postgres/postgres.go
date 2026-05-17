@@ -868,8 +868,13 @@ func (s *Store) Traverse(ctx context.Context, from memgraph.LineageID, opts memg
 	if maxNodes <= 0 {
 		maxNodes = 1024
 	}
+	dir := opts.Direction
+	if dir == "" {
+		dir = memgraph.TraverseOutgoing
+	}
 
-	visited := map[memgraph.LineageID]bool{from: true}
+	visitedNodes := map[memgraph.LineageID]bool{from: true}
+	seenEdges := map[memgraph.EdgeID]bool{}
 	var nodes []memgraph.Node
 	var edges []memgraph.Edge
 
@@ -883,19 +888,34 @@ func (s *Store) Traverse(ctx context.Context, from memgraph.LineageID, opts memg
 	for depth := 0; depth < maxDepth && len(frontier) > 0; depth++ {
 		var next []memgraph.LineageID
 		for _, cur := range frontier {
-			out, err := s.Outgoing(ctx, cur, opts)
-			if err != nil {
-				return memgraph.TraversalResult{}, err
+			var outEdges, inEdges []memgraph.Edge
+			if dir != memgraph.TraverseIncoming {
+				es, err := s.Outgoing(ctx, cur, opts)
+				if err != nil {
+					return memgraph.TraversalResult{}, err
+				}
+				outEdges = es
 			}
-			for _, e := range out {
+			if dir != memgraph.TraverseOutgoing {
+				es, err := s.Incoming(ctx, cur, opts)
+				if err != nil {
+					return memgraph.TraversalResult{}, err
+				}
+				inEdges = es
+			}
+			for _, e := range outEdges {
 				if !opts.FollowSymlinks && e.ToGraph != e.GraphID {
 					continue
 				}
-				edges = append(edges, e)
-				if visited[e.ToLineage] {
+				if seenEdges[e.ID] {
 					continue
 				}
-				visited[e.ToLineage] = true
+				seenEdges[e.ID] = true
+				edges = append(edges, e)
+				if visitedNodes[e.ToLineage] {
+					continue
+				}
+				visitedNodes[e.ToLineage] = true
 				if n, err := s.GetNodeByLineage(ctx, e.ToLineage, memgraph.ReadOpts{}); err == nil {
 					nodes = append(nodes, n)
 					if len(nodes) >= maxNodes {
@@ -905,6 +925,29 @@ func (s *Store) Traverse(ctx context.Context, from memgraph.LineageID, opts memg
 					return memgraph.TraversalResult{}, err
 				}
 				next = append(next, e.ToLineage)
+			}
+			for _, e := range inEdges {
+				if !opts.FollowSymlinks && e.GraphID != e.ToGraph {
+					continue
+				}
+				if seenEdges[e.ID] {
+					continue
+				}
+				seenEdges[e.ID] = true
+				edges = append(edges, e)
+				if visitedNodes[e.FromLineage] {
+					continue
+				}
+				visitedNodes[e.FromLineage] = true
+				if n, err := s.GetNodeByLineage(ctx, e.FromLineage, memgraph.ReadOpts{}); err == nil {
+					nodes = append(nodes, n)
+					if len(nodes) >= maxNodes {
+						return memgraph.TraversalResult{Nodes: nodes, Edges: edges}, nil
+					}
+				} else if !errors.Is(err, memgraph.ErrNotFound) {
+					return memgraph.TraversalResult{}, err
+				}
+				next = append(next, e.FromLineage)
 			}
 		}
 		frontier = next
