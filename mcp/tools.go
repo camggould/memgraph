@@ -203,6 +203,36 @@ type symlinkManifestIn struct {
 	GraphID string `json:"graph_id"`
 }
 
+// searchBatchIn fans out multiple variant queries against the same graph and
+// merges them via Reciprocal Rank Fusion. The caller (typically a coding agent
+// with full conversation context) supplies the variants; the server does not
+// generate them.
+type searchBatchIn struct {
+	GraphID string             `json:"graph_id"`
+	Queries []searchBatchQuery `json:"queries" jsonschema:"1 to 8 variant queries fanned out in parallel"`
+	Limit   int                `json:"limit,omitempty" jsonschema:"total cap on returned hits; default 20, max 100"`
+}
+
+type searchBatchQuery struct {
+	Text  string   `json:"text"`
+	Kinds []string `json:"kinds,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+	Limit int      `json:"limit,omitempty" jsonschema:"per-query limit; default 20, max 50"`
+}
+
+type searchHitWithScore struct {
+	Node           nodeOut `json:"node"`
+	RRFScore       float64 `json:"rrf_score"`
+	QueriesMatched []int   `json:"queries_matched"`
+}
+
+type searchBatchOut struct {
+	Hits         []searchHitWithScore `json:"hits"`
+	QueryCount   int                  `json:"query_count"`
+	UniqueHits   int                  `json:"unique_hits"`
+	PerQueryHits []int                `json:"per_query_hits"`
+}
+
 type createGraphIn struct {
 	Name           string         `json:"name"`
 	ConflictPolicy string         `json:"conflict_policy,omitempty" jsonschema:"lww|manual; default lww"`
@@ -328,6 +358,16 @@ func (s *Server) registerTools(srv *sdkmcp.Server) {
 		Name:        "memgraph_search",
 		Description: "Full-text search within a graph with kind/tag/freshness filters.",
 	}, s.handleSearch)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "memgraph_search_batch",
+		Description: "Run multiple search queries in parallel and merge results via " +
+			"Reciprocal Rank Fusion. Use this when a question is ambiguous, " +
+			"conceptual, or requires synonyms/paraphrases — the agent supplies " +
+			"2-8 variant queries and gets back a single ranked, deduped union. " +
+			"For single-keyword or exact-phrase lookups, use memgraph_search " +
+			"instead; batch is overkill there.",
+	}, s.handleSearchBatch)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name:        "memgraph_symlink_manifest",
@@ -501,6 +541,36 @@ func (s *Server) handleSearch(ctx context.Context, _ *sdkmcp.CallToolRequest, in
 			Node:    toNodeOut(h.Node, false),
 			Snippet: h.Snippet,
 			Score:   h.Score,
+		})
+	}
+	return nil, out, nil
+}
+
+func (s *Server) handleSearchBatch(ctx context.Context, _ *sdkmcp.CallToolRequest, in searchBatchIn) (*sdkmcp.CallToolResult, searchBatchOut, error) {
+	specs := make([]memgraph.SearchQuery, len(in.Queries))
+	for i, q := range in.Queries {
+		specs[i] = memgraph.SearchQuery{
+			Text:  q.Text,
+			Kinds: q.Kinds,
+			Tags:  q.Tags,
+			Limit: q.Limit,
+		}
+	}
+	result, err := memgraph.BatchSearch(ctx, s.store, memgraph.GraphID(in.GraphID), specs, in.Limit)
+	if err != nil {
+		return nil, searchBatchOut{}, err
+	}
+	out := searchBatchOut{
+		Hits:         make([]searchHitWithScore, 0, len(result.Hits)),
+		QueryCount:   result.QueryCount,
+		UniqueHits:   result.UniqueHits,
+		PerQueryHits: result.PerQueryHits,
+	}
+	for _, h := range result.Hits {
+		out.Hits = append(out.Hits, searchHitWithScore{
+			Node:           toNodeOut(h.Node, false),
+			RRFScore:       h.RRFScore,
+			QueriesMatched: h.QueriesMatched,
 		})
 	}
 	return nil, out, nil

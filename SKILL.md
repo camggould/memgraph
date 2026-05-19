@@ -224,6 +224,23 @@ These are different access patterns. Picking wrong wastes context.
 
 Search is graph-scoped. Cross-graph search means parallel queries, then merge.
 
+### Single vs batch search
+
+- `memgraph_search` — one query, fast, use for keyword or exact-phrase lookups
+- `memgraph_search_batch` — 2-8 variant queries in parallel, results merged
+  via Reciprocal Rank Fusion. Use for ambiguous or conceptual questions
+  where multiple phrasings could plausibly match.
+
+Heuristic: if you'd be tempted to issue 3+ sequential `memgraph_search`
+calls with different phrasings, do one `memgraph_search_batch` instead.
+Saves round-trips and gets you principled ranking.
+
+The agent (you) supplies the variants — the server does not generate them.
+For a "what do I think about deployment?" question, good variants are the
+literal phrase, a synonym (`deploy`, `production hosting`), a broader
+category (`infrastructure`), and adjacent concepts that might co-occur
+(`render`, `vercel`). 3-5 variants is the sweet spot.
+
 ### Use `memgraph_traverse` when
 
 - You know a starting `lineage_id` and want its neighborhood

@@ -218,3 +218,50 @@ type TagFreq struct {
 	Tag   string `json:"tag"`
 	Count int    `json:"count"`
 }
+
+// Batch-search tuning constants. Exported so adapter packages (the MCP server,
+// REST server, and downstream tenant-scoped wrappers like memorysvc) can share
+// a single source of truth for limits and the Reciprocal Rank Fusion k value.
+const (
+	// SearchBatchRRFK is the standard RRF k constant; 60 is the canonical
+	// value from Cormack et al. (2009).
+	SearchBatchRRFK = 60.0
+	// SearchBatchMaxQueries caps the number of variant queries an agent may
+	// submit in one batch.
+	SearchBatchMaxQueries = 8
+	// SearchBatchDefaultPerQueryLimit is the default per-variant Limit when
+	// the caller does not specify one.
+	SearchBatchDefaultPerQueryLimit = 20
+	// SearchBatchMaxPerQueryLimit caps each variant's Limit regardless of
+	// what the caller asks for.
+	SearchBatchMaxPerQueryLimit = 50
+	// SearchBatchDefaultTotalLimit is the default total-result cap applied
+	// after merging across variants.
+	SearchBatchDefaultTotalLimit = 20
+	// SearchBatchMaxTotalLimit caps the total returned hits regardless of
+	// what the caller asks for.
+	SearchBatchMaxTotalLimit = 100
+)
+
+// SearchBatchHit is one element of an RRF-fused, deduped batch-search result.
+// Score is the summed Reciprocal Rank Fusion score across the queries that
+// surfaced this lineage; QueriesMatched lists the input-query indexes that
+// contributed.
+type SearchBatchHit struct {
+	Node           Node
+	RRFScore       float64
+	QueriesMatched []int
+}
+
+// SearchBatchResult is the full output of a batch-search fan-out.
+type SearchBatchResult struct {
+	// Hits is the merged, deduped, top-limit slice ranked by RRFScore.
+	Hits []SearchBatchHit
+	// QueryCount is len(input queries).
+	QueryCount int
+	// UniqueHits is the count of distinct lineages observed across all
+	// queries, before the total-limit truncation is applied.
+	UniqueHits int
+	// PerQueryHits[i] is the number of hits returned by input query i.
+	PerQueryHits []int
+}

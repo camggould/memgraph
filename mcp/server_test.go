@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -348,6 +349,270 @@ func TestHistoryAndSearch(t *testing.T) {
 		if !h.Node.IsCurrent {
 			t.Fatalf("hit is not current: %+v", h.Node)
 		}
+	}
+}
+
+// ---- search_batch tests ----
+
+type searchHitWithScoreT struct {
+	Node           nodeOut `json:"node"`
+	RRFScore       float64 `json:"rrf_score"`
+	QueriesMatched []int   `json:"queries_matched"`
+}
+
+type searchBatchOutT struct {
+	Hits         []searchHitWithScoreT `json:"hits"`
+	QueryCount   int                   `json:"query_count"`
+	UniqueHits   int                   `json:"unique_hits"`
+	PerQueryHits []int                 `json:"per_query_hits"`
+}
+
+func TestSearchBatch_RRF_DedupesByLineage(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	mk := func(content string) nodeOut {
+		var n nodeOut
+		callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+			"graph_id": g.ID, "kind": "fact", "content": content,
+		}, &n)
+		return n
+	}
+	// "alpha bravo" should rank well for both "alpha" and "bravo" queries.
+	shared := mk("alpha bravo overlap")
+	onlyAlpha := mk("alpha solo")
+	onlyBravo := mk("bravo solo")
+
+	var out searchBatchOutT
+	callTool(t, cs, ctx, "memgraph_search_batch", map[string]any{
+		"graph_id": g.ID,
+		"queries": []map[string]any{
+			{"text": "alpha"},
+			{"text": "bravo"},
+		},
+	}, &out)
+
+	if out.QueryCount != 2 {
+		t.Fatalf("QueryCount=%d want 2", out.QueryCount)
+	}
+	if len(out.PerQueryHits) != 2 {
+		t.Fatalf("PerQueryHits=%v want len 2", out.PerQueryHits)
+	}
+	if out.UniqueHits < 3 {
+		t.Fatalf("UniqueHits=%d want >=3 (saw lineages: %+v)", out.UniqueHits, out.Hits)
+	}
+	// Each lineage must appear at most once (deduped).
+	seen := map[string]int{}
+	for _, h := range out.Hits {
+		seen[h.Node.LineageID]++
+		if seen[h.Node.LineageID] > 1 {
+			t.Fatalf("lineage %s appeared twice in deduped output", h.Node.LineageID)
+		}
+	}
+
+	// Shared lineage must outrank both single-query lineages — it gets RRF
+	// contributions from both queries, the singles get only one.
+	var rankShared, rankAlpha, rankBravo = -1, -1, -1
+	for i, h := range out.Hits {
+		switch h.Node.LineageID {
+		case shared.LineageID:
+			rankShared = i
+			if len(h.QueriesMatched) != 2 {
+				t.Fatalf("shared lineage should match 2 queries, got %v", h.QueriesMatched)
+			}
+		case onlyAlpha.LineageID:
+			rankAlpha = i
+			if len(h.QueriesMatched) != 1 {
+				t.Fatalf("alpha-only should match 1 query, got %v", h.QueriesMatched)
+			}
+		case onlyBravo.LineageID:
+			rankBravo = i
+			if len(h.QueriesMatched) != 1 {
+				t.Fatalf("bravo-only should match 1 query, got %v", h.QueriesMatched)
+			}
+		}
+	}
+	if rankShared < 0 || rankAlpha < 0 || rankBravo < 0 {
+		t.Fatalf("expected all 3 lineages in hits: shared=%d alpha=%d bravo=%d hits=%+v",
+			rankShared, rankAlpha, rankBravo, out.Hits)
+	}
+	if rankShared > rankAlpha || rankShared > rankBravo {
+		t.Fatalf("shared lineage should outrank singles; got ranks shared=%d alpha=%d bravo=%d",
+			rankShared, rankAlpha, rankBravo)
+	}
+
+	// Explicit RRF math: shared appears at rank 1 in both query results
+	// (only the shared lineage matches alpha+bravo, then the solos), so its
+	// score should be 2 * 1/(60+1) = 0.03278... Allow slack since rank
+	// ordering inside a single query depends on the underlying scoring.
+	if out.Hits[rankShared].RRFScore <= out.Hits[rankAlpha].RRFScore {
+		t.Fatalf("shared score (%v) should exceed alpha-only score (%v)",
+			out.Hits[rankShared].RRFScore, out.Hits[rankAlpha].RRFScore)
+	}
+}
+
+func TestSearchBatch_EmptyResults(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	res, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_search_batch",
+		Arguments: map[string]any{
+			"graph_id": g.ID,
+			"queries": []map[string]any{
+				{"text": "nothingherexyz"},
+				{"text": "alsonothingabc"},
+				{"text": "stillnothingqrs"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		body := ""
+		for _, c := range res.Content {
+			if tc, ok := c.(*sdkmcp.TextContent); ok {
+				body += tc.Text
+			}
+		}
+		t.Fatalf("unexpected IsError: %s", body)
+	}
+	var out searchBatchOutT
+	raw, _ := json.Marshal(res.StructuredContent)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.QueryCount != 3 {
+		t.Fatalf("QueryCount=%d want 3", out.QueryCount)
+	}
+	if len(out.Hits) != 0 {
+		t.Fatalf("expected empty hits, got %+v", out.Hits)
+	}
+	if out.UniqueHits != 0 {
+		t.Fatalf("UniqueHits=%d want 0", out.UniqueHits)
+	}
+	if len(out.PerQueryHits) != 3 {
+		t.Fatalf("PerQueryHits=%v want len 3", out.PerQueryHits)
+	}
+	for i, n := range out.PerQueryHits {
+		if n != 0 {
+			t.Fatalf("PerQueryHits[%d]=%d want 0", i, n)
+		}
+	}
+}
+
+func TestSearchBatch_TotalLimit(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	// Seed 12 distinct lineages all matching "foo".
+	for i := 0; i < 12; i++ {
+		var n nodeOut
+		callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+			"graph_id": g.ID, "kind": "fact",
+			"content": fmt.Sprintf("foo bar %d", i),
+		}, &n)
+	}
+
+	var out searchBatchOutT
+	callTool(t, cs, ctx, "memgraph_search_batch", map[string]any{
+		"graph_id": g.ID,
+		"queries":  []map[string]any{{"text": "foo"}},
+		"limit":    5,
+	}, &out)
+	if len(out.Hits) != 5 {
+		t.Fatalf("expected 5 hits after total limit, got %d", len(out.Hits))
+	}
+	if out.UniqueHits < 12 {
+		t.Fatalf("UniqueHits=%d want >=12 (pre-truncation count)", out.UniqueHits)
+	}
+}
+
+func TestSearchBatch_PerQueryLimitClamp(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	// Seed more than 50 matching nodes so the clamp kicks in.
+	for i := 0; i < 60; i++ {
+		var n nodeOut
+		callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+			"graph_id": g.ID, "kind": "fact",
+			"content": fmt.Sprintf("clampme entry %d", i),
+		}, &n)
+	}
+	var out searchBatchOutT
+	callTool(t, cs, ctx, "memgraph_search_batch", map[string]any{
+		"graph_id": g.ID,
+		"queries": []map[string]any{
+			{"text": "clampme", "limit": 500},
+		},
+		"limit": 100,
+	}, &out)
+	if out.PerQueryHits[0] > 50 {
+		t.Fatalf("per-query limit should clamp to 50, got %d", out.PerQueryHits[0])
+	}
+	if out.PerQueryHits[0] != 50 {
+		t.Fatalf("expected exactly 50 hits at clamp, got %d (UniqueHits=%d)", out.PerQueryHits[0], out.UniqueHits)
+	}
+}
+
+func TestSearchBatch_Validation(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	// 0 queries → error.
+	res, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_search_batch",
+		Arguments: map[string]any{
+			"graph_id": g.ID,
+			"queries":  []map[string]any{},
+		},
+	})
+	if err == nil && !res.IsError {
+		t.Fatalf("expected error for 0 queries, got %+v", res)
+	}
+
+	// 9 queries → error.
+	nine := make([]map[string]any, 9)
+	for i := range nine {
+		nine[i] = map[string]any{"text": fmt.Sprintf("q%d", i)}
+	}
+	res2, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_search_batch",
+		Arguments: map[string]any{
+			"graph_id": g.ID,
+			"queries":  nine,
+		},
+	})
+	if err == nil && !res2.IsError {
+		t.Fatalf("expected error for 9 queries, got %+v", res2)
+	}
+
+	// missing graph_id → error.
+	res3, err := cs.CallTool(ctx, &sdkmcp.CallToolParams{
+		Name: "memgraph_search_batch",
+		Arguments: map[string]any{
+			"queries": []map[string]any{{"text": "x"}},
+		},
+	})
+	if err == nil && !res3.IsError {
+		t.Fatalf("expected error for missing graph_id, got %+v", res3)
 	}
 }
 
