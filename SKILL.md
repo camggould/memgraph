@@ -16,7 +16,22 @@ This guide tells you how to use it well. The first principle is: **structure mat
 - **Edge** — directed, typed relationship between two lineages. Edges target lineages (not specific versions), so links survive edits.
 - **Graph** — a unit of isolation. A deployment hosts many graphs; edges between graphs are first-class **symlinks**.
 
-Available tools: `memgraph_list_graphs`, `memgraph_create_graph`, `memgraph_get_node`, `memgraph_history`, `memgraph_traverse`, `memgraph_search`, `memgraph_symlink_manifest`, `memgraph_put_node`, `memgraph_put_edge`, `memgraph_delete_edge`. Plus `memgraph://` resources for browsing.
+Available tools: `memgraph_list_graphs`, `memgraph_create_graph`, `memgraph_get_node`, `memgraph_history`, `memgraph_traverse`, `memgraph_search`, `memgraph_symlink_manifest`, `memgraph_describe_schema`, `memgraph_list_tags`, `memgraph_put_node`, `memgraph_put_edge`, `memgraph_delete_edge`. Plus `memgraph://` resources for browsing.
+
+---
+
+## Vocabulary discovery (before writing anything new)
+
+At session start, after `memgraph_list_graphs`, call
+`memgraph_describe_schema(graph_id)` ONCE to learn the user's existing
+vocabulary. Reuse existing kinds and tag prefixes. Only introduce a
+new prefix when nothing fits.
+
+If you find yourself about to write a tag that looks like an existing
+one with different punctuation (`topic-auth` vs `topic:auth`), STOP.
+Use the existing one. The graph rewards convergence.
+
+For autocomplete during longer sessions, use `memgraph_list_tags(graph_id, prefix)`.
 
 ---
 

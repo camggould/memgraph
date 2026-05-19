@@ -182,3 +182,39 @@ type GraphRef struct {
 	GraphID   GraphID
 	EdgeCount int
 }
+
+// SchemaDescription summarizes the kind and tag vocabulary currently in
+// use within a graph. It is intended as a one-shot snapshot an agent can
+// fetch at session start to learn the user's existing conventions and
+// avoid inventing parallel ones.
+type SchemaDescription struct {
+	GraphID     GraphID         `json:"graph_id"`
+	NodeCount   int             `json:"node_count"`
+	Kinds       []KindFreq      `json:"kinds"`
+	TagPrefixes []TagPrefixFreq `json:"tag_prefixes"`
+	Tags        []TagFreq       `json:"tags"`
+}
+
+// KindFreq is a kind label with the number of current-version nodes using
+// it and up to three example summaries to hint at the kind's semantic
+// role.
+type KindFreq struct {
+	Kind     string   `json:"kind"`
+	Count    int      `json:"count"`
+	Examples []string `json:"examples,omitempty"` // up to 3 short summaries
+}
+
+// TagPrefixFreq groups together tags sharing a "prefix:value" namespace.
+// Count is the total number of node-tag uses with this prefix; Values is
+// up to ten distinct trailing values seen.
+type TagPrefixFreq struct {
+	Prefix string   `json:"prefix"` // e.g. "protein"
+	Count  int      `json:"count"`  // total node-tag uses with this prefix
+	Values []string `json:"values"` // up to 10 distinct values
+}
+
+// TagFreq is a single tag and its node-use count.
+type TagFreq struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
+}

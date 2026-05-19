@@ -242,6 +242,65 @@ type okOut struct {
 	OK bool `json:"ok"`
 }
 
+type describeSchemaIn struct {
+	GraphID string `json:"graph_id"`
+}
+
+type kindFreqOut struct {
+	Kind     string   `json:"kind"`
+	Count    int      `json:"count"`
+	Examples []string `json:"examples,omitempty"`
+}
+
+type tagPrefixFreqOut struct {
+	Prefix string   `json:"prefix"`
+	Count  int      `json:"count"`
+	Values []string `json:"values"`
+}
+
+type tagFreqOut struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
+}
+
+type schemaDescriptionOut struct {
+	GraphID     string             `json:"graph_id"`
+	NodeCount   int                `json:"node_count"`
+	Kinds       []kindFreqOut      `json:"kinds"`
+	TagPrefixes []tagPrefixFreqOut `json:"tag_prefixes"`
+	Tags        []tagFreqOut       `json:"tags"`
+}
+
+func toSchemaDescriptionOut(s memgraph.SchemaDescription) schemaDescriptionOut {
+	out := schemaDescriptionOut{
+		GraphID:     string(s.GraphID),
+		NodeCount:   s.NodeCount,
+		Kinds:       make([]kindFreqOut, 0, len(s.Kinds)),
+		TagPrefixes: make([]tagPrefixFreqOut, 0, len(s.TagPrefixes)),
+		Tags:        make([]tagFreqOut, 0, len(s.Tags)),
+	}
+	for _, k := range s.Kinds {
+		out.Kinds = append(out.Kinds, kindFreqOut{Kind: k.Kind, Count: k.Count, Examples: k.Examples})
+	}
+	for _, p := range s.TagPrefixes {
+		out.TagPrefixes = append(out.TagPrefixes, tagPrefixFreqOut{Prefix: p.Prefix, Count: p.Count, Values: p.Values})
+	}
+	for _, t := range s.Tags {
+		out.Tags = append(out.Tags, tagFreqOut{Tag: t.Tag, Count: t.Count})
+	}
+	return out
+}
+
+type listTagsIn struct {
+	GraphID string `json:"graph_id"`
+	Prefix  string `json:"prefix,omitempty" jsonschema:"optional prefix; matches tags starting with prefix"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"default 100, max 100"`
+}
+
+type listTagsOut struct {
+	Tags []tagFreqOut `json:"tags"`
+}
+
 // --- Handler registration ---
 
 func (s *Server) registerTools(srv *sdkmcp.Server) {
@@ -294,6 +353,24 @@ func (s *Server) registerTools(srv *sdkmcp.Server) {
 		Name:        "memgraph_delete_edge",
 		Description: "Remove an edge by id.",
 	}, s.handleDeleteEdge)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "memgraph_describe_schema",
+		Description: "Snapshot the kind and tag vocabulary currently in use in a graph. " +
+			"Returns kinds with counts and example summaries, tag prefixes (e.g. " +
+			"\"protein:\" → values [beef, chicken, fish]) with usage counts, and the " +
+			"top tags by frequency. Call once at session start to learn the user's " +
+			"existing conventions and avoid inventing parallel ones (topic:auth vs " +
+			"topic-auth vs auth-topic). Cheap; designed for one-shot vocabulary discovery.",
+	}, s.handleDescribeSchema)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "memgraph_list_tags",
+		Description: "Prefix-filtered tag autocomplete sorted by frequency. Pass a graph_id " +
+			"and optional prefix; returns up to 100 tags starting with that prefix " +
+			"and how often each is used. Use as a follow-up to memgraph_describe_schema " +
+			"when you have a known prefix and want to see all values under it.",
+	}, s.handleListTags)
 }
 
 // --- Handlers ---
@@ -516,6 +593,36 @@ func (s *Server) handlePutEdge(ctx context.Context, _ *sdkmcp.CallToolRequest, i
 		return nil, edgeOut{}, err
 	}
 	return nil, toEdgeOut(e), nil
+}
+
+func (s *Server) handleDescribeSchema(ctx context.Context, _ *sdkmcp.CallToolRequest, in describeSchemaIn) (*sdkmcp.CallToolResult, schemaDescriptionOut, error) {
+	if in.GraphID == "" {
+		return nil, schemaDescriptionOut{}, fmt.Errorf("%w: graph_id required", memgraph.ErrInvalidInput)
+	}
+	d, err := s.store.DescribeSchema(ctx, memgraph.GraphID(in.GraphID))
+	if err != nil {
+		return nil, schemaDescriptionOut{}, err
+	}
+	return nil, toSchemaDescriptionOut(d), nil
+}
+
+func (s *Server) handleListTags(ctx context.Context, _ *sdkmcp.CallToolRequest, in listTagsIn) (*sdkmcp.CallToolResult, listTagsOut, error) {
+	if in.GraphID == "" {
+		return nil, listTagsOut{}, fmt.Errorf("%w: graph_id required", memgraph.ErrInvalidInput)
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	tags, err := s.store.ListTags(ctx, memgraph.GraphID(in.GraphID), in.Prefix, limit)
+	if err != nil {
+		return nil, listTagsOut{}, err
+	}
+	out := listTagsOut{Tags: make([]tagFreqOut, 0, len(tags))}
+	for _, t := range tags {
+		out.Tags = append(out.Tags, tagFreqOut{Tag: t.Tag, Count: t.Count})
+	}
+	return nil, out, nil
 }
 
 func (s *Server) handleDeleteEdge(ctx context.Context, _ *sdkmcp.CallToolRequest, in deleteEdgeIn) (*sdkmcp.CallToolResult, okOut, error) {

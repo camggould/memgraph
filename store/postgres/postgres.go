@@ -1134,6 +1134,201 @@ func (s *Store) SymlinkManifest(ctx context.Context, graphID memgraph.GraphID) (
 	return out, rows.Err()
 }
 
+// --- Schema discovery ---
+
+func (s *Store) DescribeSchema(ctx context.Context, graphID memgraph.GraphID) (memgraph.SchemaDescription, error) {
+	out := memgraph.SchemaDescription{GraphID: graphID}
+
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM nodes WHERE graph_id = $1 AND superseded_by IS NULL`,
+		string(graphID)).Scan(&out.NodeCount); err != nil {
+		return out, err
+	}
+
+	kindRows, err := s.pool.Query(ctx,
+		`SELECT kind, COUNT(*) AS c
+		   FROM nodes
+		  WHERE graph_id = $1 AND superseded_by IS NULL
+		  GROUP BY kind
+		  ORDER BY c DESC, kind ASC`, string(graphID))
+	if err != nil {
+		return out, err
+	}
+	var kinds []memgraph.KindFreq
+	for kindRows.Next() {
+		var k string
+		var c int
+		if err := kindRows.Scan(&k, &c); err != nil {
+			kindRows.Close()
+			return out, err
+		}
+		kinds = append(kinds, memgraph.KindFreq{Kind: k, Count: c})
+	}
+	kindRows.Close()
+	if err := kindRows.Err(); err != nil {
+		return out, err
+	}
+
+	for i := range kinds {
+		exRows, err := s.pool.Query(ctx,
+			`SELECT COALESCE(NULLIF(summary, ''), content)
+			   FROM nodes
+			  WHERE graph_id = $1 AND superseded_by IS NULL AND kind = $2
+			  ORDER BY created_at DESC
+			  LIMIT 3`, string(graphID), kinds[i].Kind)
+		if err != nil {
+			return out, err
+		}
+		var examples []string
+		for exRows.Next() {
+			var ex string
+			if err := exRows.Scan(&ex); err != nil {
+				exRows.Close()
+				return out, err
+			}
+			examples = append(examples, truncateExample(ex))
+		}
+		exRows.Close()
+		if err := exRows.Err(); err != nil {
+			return out, err
+		}
+		kinds[i].Examples = examples
+	}
+	out.Kinds = kinds
+
+	tags, err := s.listTags(ctx, graphID, "", 50)
+	if err != nil {
+		return out, err
+	}
+	out.Tags = tags
+
+	allTags, err := s.listTags(ctx, graphID, "", 0)
+	if err != nil {
+		return out, err
+	}
+	out.TagPrefixes = derivePrefixes(allTags)
+
+	return out, nil
+}
+
+func (s *Store) ListTags(ctx context.Context, graphID memgraph.GraphID, prefix string, limit int) ([]memgraph.TagFreq, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	return s.listTags(ctx, graphID, prefix, limit)
+}
+
+func (s *Store) listTags(ctx context.Context, graphID memgraph.GraphID, prefix string, limit int) ([]memgraph.TagFreq, error) {
+	args := []any{string(graphID)}
+	// Tags are JSONB arrays — unnest the array elements via
+	// jsonb_array_elements_text. Guard against NULL/non-array values which
+	// would otherwise raise an error in the LATERAL.
+	q := `SELECT t.tag, COUNT(*) AS c
+	        FROM nodes,
+	             LATERAL jsonb_array_elements_text(
+	                 CASE WHEN jsonb_typeof(nodes.tags) = 'array' THEN nodes.tags
+	                      ELSE '[]'::jsonb END
+	             ) AS t(tag)
+	       WHERE nodes.graph_id = $1 AND nodes.superseded_by IS NULL`
+	if prefix != "" {
+		esc := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(prefix)
+		q += ` AND t.tag LIKE $2 ESCAPE '\'`
+		args = append(args, esc+"%")
+	}
+	q += ` GROUP BY t.tag ORDER BY c DESC, t.tag ASC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []memgraph.TagFreq
+	for rows.Next() {
+		var t string
+		var c int
+		if err := rows.Scan(&t, &c); err != nil {
+			return nil, err
+		}
+		out = append(out, memgraph.TagFreq{Tag: t, Count: c})
+	}
+	return out, rows.Err()
+}
+
+func truncateExample(s string) string {
+	const max = 160
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+func derivePrefixes(tags []memgraph.TagFreq) []memgraph.TagPrefixFreq {
+	type bucket struct {
+		count  int
+		values []memgraph.TagFreq
+	}
+	groups := map[string]*bucket{}
+	order := []string{}
+
+	for _, tf := range tags {
+		idx := strings.IndexByte(tf.Tag, ':')
+		if idx <= 0 || idx >= len(tf.Tag)-1 {
+			continue
+		}
+		p := tf.Tag[:idx]
+		v := tf.Tag[idx+1:]
+		b, ok := groups[p]
+		if !ok {
+			b = &bucket{}
+			groups[p] = b
+			order = append(order, p)
+		}
+		b.count += tf.Count
+		b.values = append(b.values, memgraph.TagFreq{Tag: v, Count: tf.Count})
+	}
+
+	out := make([]memgraph.TagPrefixFreq, 0, len(order))
+	for _, p := range order {
+		b := groups[p]
+		for i := 1; i < len(b.values); i++ {
+			for j := i; j > 0; j-- {
+				if b.values[j].Count > b.values[j-1].Count ||
+					(b.values[j].Count == b.values[j-1].Count && b.values[j].Tag < b.values[j-1].Tag) {
+					b.values[j], b.values[j-1] = b.values[j-1], b.values[j]
+				} else {
+					break
+				}
+			}
+		}
+		vals := make([]string, 0, len(b.values))
+		for i, vf := range b.values {
+			if i >= 10 {
+				break
+			}
+			vals = append(vals, vf.Tag)
+		}
+		out = append(out, memgraph.TagPrefixFreq{
+			Prefix: p,
+			Count:  b.count,
+			Values: vals,
+		})
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			if out[j].Count > out[j-1].Count ||
+				(out[j].Count == out[j-1].Count && out[j].Prefix < out[j-1].Prefix) {
+				out[j], out[j-1] = out[j-1], out[j]
+			} else {
+				break
+			}
+		}
+	}
+	return out
+}
+
 // --- Subscriptions ---
 
 func (s *Store) Subscribe(h memgraph.WriteHandler) (memgraph.Unsubscribe, error) {

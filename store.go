@@ -48,6 +48,14 @@ type Store interface {
 	Search(ctx context.Context, graphID GraphID, q SearchQuery) ([]SearchHit, error)
 	SymlinkManifest(ctx context.Context, graphID GraphID) (SymlinkManifest, error)
 
+	// DescribeSchema returns the kind/tag distribution for a graph,
+	// useful for an agent to learn what vocabulary exists before writing.
+	DescribeSchema(ctx context.Context, graphID GraphID) (SchemaDescription, error)
+
+	// ListTags returns tags matching prefix (or all tags if prefix is empty),
+	// sorted by usage frequency descending. limit caps the result at 100 max.
+	ListTags(ctx context.Context, graphID GraphID, prefix string, limit int) ([]TagFreq, error)
+
 	// --- Hooks (for derived indexes; v1.1 vector index uses this) ---
 
 	Subscribe(h WriteHandler) (Unsubscribe, error)

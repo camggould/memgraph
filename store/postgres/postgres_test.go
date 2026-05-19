@@ -794,6 +794,144 @@ func TestSubscribe(t *testing.T) {
 	}
 }
 
+func TestDescribeSchema(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{Name: "g"})
+
+	for i := 0; i < 3; i++ {
+		mustPutNode(t, s, memgraph.NodeInput{
+			GraphID: g.ID, Kind: "recipe", Content: "r", Summary: "recipe summary",
+			Tags: []string{"protein:beef", "cuisine:french", "weeknight"}, CreatedBy: "t",
+		})
+	}
+	for i := 0; i < 2; i++ {
+		mustPutNode(t, s, memgraph.NodeInput{
+			GraphID: g.ID, Kind: "recipe", Content: "r2", Summary: "another recipe",
+			Tags: []string{"protein:chicken", "cuisine:french"}, CreatedBy: "t",
+		})
+	}
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "preference", Content: "loves spicy", Summary: "spicy",
+		Tags: []string{"protein:fish", "weeknight"}, CreatedBy: "t",
+	})
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "person", Content: "alice", Summary: "alice",
+		CreatedBy: "t",
+	})
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "fact", Content: "facty", Summary: "f",
+		Tags: []string{"protein:veg"}, CreatedBy: "t",
+	})
+
+	d, err := s.DescribeSchema(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("DescribeSchema: %v", err)
+	}
+
+	if d.NodeCount != 8 {
+		t.Fatalf("NodeCount=%d want 8", d.NodeCount)
+	}
+	if len(d.Kinds) != 4 {
+		t.Fatalf("expected 4 kinds, got %d (%+v)", len(d.Kinds), d.Kinds)
+	}
+	if d.Kinds[0].Kind != "recipe" || d.Kinds[0].Count != 5 {
+		t.Fatalf("top kind: %+v", d.Kinds[0])
+	}
+	if len(d.Kinds[0].Examples) == 0 || len(d.Kinds[0].Examples) > 3 {
+		t.Fatalf("recipe examples: %v", d.Kinds[0].Examples)
+	}
+
+	prefixByName := map[string]memgraph.TagPrefixFreq{}
+	for _, p := range d.TagPrefixes {
+		prefixByName[p.Prefix] = p
+	}
+	prot, ok := prefixByName["protein"]
+	if !ok {
+		t.Fatalf("missing protein prefix; got %+v", d.TagPrefixes)
+	}
+	if prot.Count != 7 {
+		t.Fatalf("protein prefix count=%d want 7", prot.Count)
+	}
+	if len(prot.Values) != 4 {
+		t.Fatalf("protein values len=%d want 4 (%v)", len(prot.Values), prot.Values)
+	}
+	if prot.Values[0] != "beef" {
+		t.Fatalf("protein top value=%q want beef", prot.Values[0])
+	}
+	cuis, ok := prefixByName["cuisine"]
+	if !ok || cuis.Count != 5 || len(cuis.Values) != 1 || cuis.Values[0] != "french" {
+		t.Fatalf("cuisine prefix: %+v", cuis)
+	}
+
+	tagCounts := map[string]int{}
+	for _, t := range d.Tags {
+		tagCounts[t.Tag] = t.Count
+	}
+	if tagCounts["protein:beef"] != 3 {
+		t.Fatalf("protein:beef count=%d want 3", tagCounts["protein:beef"])
+	}
+	if tagCounts["weeknight"] != 4 {
+		t.Fatalf("weeknight count=%d want 4", tagCounts["weeknight"])
+	}
+}
+
+func TestListTags(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{Name: "g"})
+
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "x", Content: "a",
+		Tags: []string{"protein:beef", "weeknight"}, CreatedBy: "t",
+	})
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "x", Content: "b",
+		Tags: []string{"protein:beef", "protein:chicken"}, CreatedBy: "t",
+	})
+	mustPutNode(t, s, memgraph.NodeInput{
+		GraphID: g.ID, Kind: "x", Content: "c",
+		Tags: []string{"cuisine:thai"}, CreatedBy: "t",
+	})
+
+	all, err := s.ListTags(ctx, g.ID, "", 0)
+	if err != nil {
+		t.Fatalf("ListTags: %v", err)
+	}
+	if len(all) == 0 || all[0].Tag != "protein:beef" || all[0].Count != 2 {
+		t.Fatalf("top tag: %+v", all)
+	}
+
+	prot, err := s.ListTags(ctx, g.ID, "protein:", 0)
+	if err != nil {
+		t.Fatalf("ListTags protein: %v", err)
+	}
+	if len(prot) != 2 {
+		t.Fatalf("protein: results=%+v", prot)
+	}
+	for _, p := range prot {
+		if p.Tag != "protein:beef" && p.Tag != "protein:chicken" {
+			t.Fatalf("unexpected tag in protein: results: %s", p.Tag)
+		}
+	}
+
+	none, err := s.ListTags(ctx, g.ID, "nothingmatches", 0)
+	if err != nil {
+		t.Fatalf("ListTags none: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("expected no results, got %+v", none)
+	}
+
+	capped, err := s.ListTags(ctx, g.ID, "", 1)
+	if err != nil {
+		t.Fatalf("ListTags limit=1: %v", err)
+	}
+	if len(capped) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(capped))
+	}
+}
+
 func TestSubscribe_Graph(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
