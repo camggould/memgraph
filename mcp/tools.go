@@ -268,6 +268,66 @@ type deleteEdgeIn struct {
 	EdgeID string `json:"edge_id"`
 }
 
+// --- put_subgraph ---
+
+// putSubgraphIn is the bulk-write payload. Lets agents write a small set of
+// related nodes and edges in one round-trip instead of N+M sequential calls.
+// At least one of nodes or edges must be non-empty. Limits: 50 nodes and 100
+// edges per call. Best-effort semantics: per-item errors live inside the
+// result so callers can retry just the failures.
+type putSubgraphIn struct {
+	GraphID string         `json:"graph_id"`
+	Nodes   []putNodeSpec  `json:"nodes,omitempty" jsonschema:"0 to 50 nodes; written in order before edges"`
+	Edges   []putEdgeSpec  `json:"edges,omitempty" jsonschema:"0 to 100 edges; refs resolve against nodes earlier in this call"`
+}
+
+type putNodeSpec struct {
+	// Ref is an opaque per-call identifier. Edges in the same call can target
+	// this node via from_ref/to_ref before its lineage_id is known.
+	Ref string `json:"ref,omitempty" jsonschema:"per-call local id; lets edges in this call target this node before its lineage_id exists"`
+	// LineageID, if set, makes this an UPDATE on an existing lineage.
+	// If empty, a new lineage is created.
+	LineageID      string         `json:"lineage_id,omitempty" jsonschema:"omit to start a new lineage; set to update an existing one"`
+	BasedOnVersion *int           `json:"based_on_version,omitempty" jsonschema:"optimistic-concurrency hint for updates"`
+	Kind           string         `json:"kind"`
+	Content        string         `json:"content"`
+	Summary        string         `json:"summary,omitempty"`
+	Tags           []string       `json:"tags,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	FreshnessAt    string         `json:"freshness_at,omitempty" jsonschema:"RFC3339"`
+	CreatedBy      string         `json:"created_by,omitempty"`
+}
+
+type putEdgeSpec struct {
+	FromRef     string         `json:"from_ref,omitempty" jsonschema:"target a node from this call by its ref; mutually exclusive with from_lineage"`
+	FromLineage string         `json:"from_lineage,omitempty" jsonschema:"target an existing lineage by id; mutually exclusive with from_ref"`
+	ToRef       string         `json:"to_ref,omitempty" jsonschema:"target a node from this call by its ref; mutually exclusive with to_lineage"`
+	ToLineage   string         `json:"to_lineage,omitempty" jsonschema:"target an existing lineage by id; mutually exclusive with to_ref"`
+	ToGraph     string         `json:"to_graph,omitempty" jsonschema:"defaults to graph_id; set for cross-graph symlinks"`
+	Kind        string         `json:"kind"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	Ordinal     *int           `json:"ordinal,omitempty"`
+	CreatedBy   string         `json:"created_by,omitempty"`
+}
+
+type putSubgraphNodeOut struct {
+	Ref       string `json:"ref,omitempty"`
+	LineageID string `json:"lineage_id,omitempty"`
+	Version   int    `json:"version,omitempty"`
+	Created   bool   `json:"created"`
+	Error     string `json:"error,omitempty"`
+}
+
+type putSubgraphEdgeOut struct {
+	EdgeID string `json:"edge_id,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type putSubgraphOut struct {
+	Nodes []putSubgraphNodeOut `json:"nodes"`
+	Edges []putSubgraphEdgeOut `json:"edges"`
+}
+
 type okOut struct {
 	OK bool `json:"ok"`
 }
@@ -393,6 +453,19 @@ func (s *Server) registerTools(srv *sdkmcp.Server) {
 		Name:        "memgraph_delete_edge",
 		Description: "Remove an edge by id.",
 	}, s.handleDeleteEdge)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "memgraph_put_subgraph",
+		Description: "Bulk-write up to 50 nodes and 100 edges in one call. Use when " +
+			"writing 2+ related facts in the same turn (e.g. a decision node " +
+			"plus its supersedes/because edges) so you don't pay N+M round-trips. " +
+			"Each node may carry an optional `ref` string; edges in the same " +
+			"call can target nodes via `from_ref`/`to_ref` before any lineage_id " +
+			"exists. A node with `lineage_id` set is an update; without is a " +
+			"create. Best-effort: no transaction wraps the batch, so per-item " +
+			"errors are returned inside the result (nodes[].error, edges[].error) " +
+			"and the agent can retry just the failures.",
+	}, s.handlePutSubgraph)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name: "memgraph_describe_schema",
@@ -703,4 +776,76 @@ func (s *Server) handleDeleteEdge(ctx context.Context, _ *sdkmcp.CallToolRequest
 		return nil, okOut{}, err
 	}
 	return nil, okOut{OK: true}, nil
+}
+
+func (s *Server) handlePutSubgraph(ctx context.Context, _ *sdkmcp.CallToolRequest, in putSubgraphIn) (*sdkmcp.CallToolResult, putSubgraphOut, error) {
+	nodes := make([]memgraph.NodeSpec, len(in.Nodes))
+	for i, n := range in.Nodes {
+		var fresh *time.Time
+		if n.FreshnessAt != "" {
+			t, err := time.Parse(time.RFC3339, n.FreshnessAt)
+			if err != nil {
+				return nil, putSubgraphOut{}, fmt.Errorf("%w: nodes[%d].freshness_at: %v", memgraph.ErrInvalidInput, i, err)
+			}
+			fresh = &t
+		}
+		createdBy := n.CreatedBy
+		if createdBy == "" {
+			createdBy = "unknown"
+		}
+		nodes[i] = memgraph.NodeSpec{
+			Ref:            n.Ref,
+			LineageID:      n.LineageID,
+			BasedOnVersion: n.BasedOnVersion,
+			Kind:           n.Kind,
+			Content:        n.Content,
+			Summary:        n.Summary,
+			Tags:           n.Tags,
+			Metadata:       n.Metadata,
+			FreshnessAt:    fresh,
+			CreatedBy:      createdBy,
+		}
+	}
+	edges := make([]memgraph.EdgeSpec, len(in.Edges))
+	for i, e := range in.Edges {
+		edges[i] = memgraph.EdgeSpec{
+			FromRef:     e.FromRef,
+			FromLineage: e.FromLineage,
+			ToRef:       e.ToRef,
+			ToLineage:   e.ToLineage,
+			ToGraph:     e.ToGraph,
+			Kind:        e.Kind,
+			Metadata:    e.Metadata,
+			Ordinal:     e.Ordinal,
+			CreatedBy:   e.CreatedBy,
+		}
+	}
+	res, err := memgraph.PutSubgraph(ctx, s.store, memgraph.GraphID(in.GraphID), memgraph.PutSubgraphInput{
+		GraphID: memgraph.GraphID(in.GraphID),
+		Nodes:   nodes,
+		Edges:   edges,
+	})
+	if err != nil {
+		return nil, putSubgraphOut{}, err
+	}
+	out := putSubgraphOut{
+		Nodes: make([]putSubgraphNodeOut, len(res.Nodes)),
+		Edges: make([]putSubgraphEdgeOut, len(res.Edges)),
+	}
+	for i, n := range res.Nodes {
+		out.Nodes[i] = putSubgraphNodeOut{
+			Ref:       n.Ref,
+			LineageID: n.LineageID,
+			Version:   n.Version,
+			Created:   n.Created,
+			Error:     n.Error,
+		}
+	}
+	for i, e := range res.Edges {
+		out.Edges[i] = putSubgraphEdgeOut{
+			EdgeID: e.EdgeID,
+			Error:  e.Error,
+		}
+	}
+	return nil, out, nil
 }

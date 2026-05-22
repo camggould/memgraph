@@ -16,7 +16,7 @@ This guide tells you how to use it well. The first principle is: **structure mat
 - **Edge** — directed, typed relationship between two lineages. Edges target lineages (not specific versions), so links survive edits.
 - **Graph** — a unit of isolation. A deployment hosts many graphs; edges between graphs are first-class **symlinks**.
 
-Available tools: `memgraph_list_graphs`, `memgraph_create_graph`, `memgraph_get_node`, `memgraph_history`, `memgraph_traverse`, `memgraph_search`, `memgraph_symlink_manifest`, `memgraph_describe_schema`, `memgraph_list_tags`, `memgraph_put_node`, `memgraph_put_edge`, `memgraph_delete_edge`. Plus `memgraph://` resources for browsing.
+Available tools: `memgraph_list_graphs`, `memgraph_create_graph`, `memgraph_get_node`, `memgraph_history`, `memgraph_traverse`, `memgraph_search`, `memgraph_search_batch`, `memgraph_symlink_manifest`, `memgraph_describe_schema`, `memgraph_list_tags`, `memgraph_put_node`, `memgraph_put_edge`, `memgraph_put_subgraph`, `memgraph_delete_edge`. Plus `memgraph://` resources for browsing.
 
 ---
 
@@ -149,6 +149,47 @@ A common mistake: writing a node "Alice" and a node "Bob" with a `married_to` ed
 - Or accept that the relationship is a structure-only signal, discoverable via `memgraph_traverse` but not `memgraph_search`.
 
 Use both patterns together: facts say *what*, edges express *how things connect*.
+
+### Writing 2+ related facts in one turn: use `memgraph_put_subgraph`
+
+If a single turn produces multiple nodes that should be linked, do NOT issue
+N separate `memgraph_put_node` calls followed by M separate
+`memgraph_put_edge` calls. That's N+M round-trips for a single logical
+write. Use `memgraph_put_subgraph` instead:
+
+```
+memgraph_put_subgraph(
+  graph_id = ...,
+  nodes = [
+    {ref: "decision",  kind: "decision",  content: "use postgres on render"},
+    {ref: "rationale", kind: "fact",      content: "postgres has FTS we need"},
+    {lineage_id: "<old-decision-lineage>", kind: "decision", content: "..."},
+  ],
+  edges = [
+    {from_ref: "decision", to_ref: "rationale",                kind: "because"},
+    {from_ref: "decision", to_lineage: "<old-decision-lineage>", kind: "supersedes"},
+  ],
+)
+```
+
+Each node may declare an opaque `ref` string. Edges in the same call can target
+nodes by `from_ref`/`to_ref` *before any lineage_id has been assigned*. Edges
+can also target existing lineages via `from_lineage`/`to_lineage`. Refs and
+lineage ids are mutually exclusive on the same side of an edge.
+
+A node with `lineage_id` set is an **update** (new version on existing
+lineage). Without `lineage_id` it is a **create** (new lineage). The
+per-item `created` flag reflects which path was taken.
+
+Limits: 50 nodes and 100 edges per call. Best-effort semantics — no
+transaction wraps the batch, so a single item failing does not abort the
+others. Per-item errors live in `nodes[i].error` / `edges[i].error`; if a
+node fails, edges that referenced its ref fail with `ref not found: <ref>`.
+Retry only the failed items.
+
+When in doubt: if you're about to write 2+ related items, use
+`memgraph_put_subgraph`. Save the round-trips for genuinely incremental
+work.
 
 ---
 
