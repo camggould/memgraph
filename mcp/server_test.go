@@ -844,3 +844,60 @@ func TestResources_GraphAndLineage(t *testing.T) {
 		t.Fatalf("lineage mismatch: %+v", gotNode)
 	}
 }
+
+func TestListNodes_CompactStripsHeavyFields(t *testing.T) {
+	store := openStore(t)
+	cs, ctx := connect(t, store)
+
+	var g graphOut
+	callTool(t, cs, ctx, "memgraph_create_graph", map[string]any{"name": "g"}, &g)
+
+	var n nodeOut
+	callTool(t, cs, ctx, "memgraph_put_node", map[string]any{
+		"graph_id": g.ID,
+		"kind":     "fact",
+		"content":  "heavy payload that compact mode should not return",
+		"summary":  "canvas-label",
+		"tags":     []string{"x"},
+		"metadata": map[string]any{"k": "v"},
+	}, &n)
+
+	// Full mode: content/metadata/created_by present.
+	var full listNodesOut
+	callTool(t, cs, ctx, "memgraph_list_nodes", map[string]any{
+		"graph_id": g.ID,
+	}, &full)
+	if len(full.Nodes) != 1 {
+		t.Fatalf("full: want 1 node, got %d", len(full.Nodes))
+	}
+	if full.Nodes[0].Content == "" || full.Nodes[0].Metadata == nil || full.Nodes[0].CreatedBy == "" {
+		t.Fatalf("full: missing heavy fields: %+v", full.Nodes[0])
+	}
+
+	// Compact mode: content/metadata/created_by absent (zero value).
+	var compact listNodesOut
+	callTool(t, cs, ctx, "memgraph_list_nodes", map[string]any{
+		"graph_id": g.ID,
+		"compact":  true,
+	}, &compact)
+	if len(compact.Nodes) != 1 {
+		t.Fatalf("compact: want 1 node, got %d", len(compact.Nodes))
+	}
+	c := compact.Nodes[0]
+	if c.Content != "" {
+		t.Fatalf("compact: content not stripped: %q", c.Content)
+	}
+	if c.Metadata != nil {
+		t.Fatalf("compact: metadata not stripped: %v", c.Metadata)
+	}
+	if c.CreatedBy != "" {
+		t.Fatalf("compact: created_by not stripped: %q", c.CreatedBy)
+	}
+	if c.FreshnessAt != nil {
+		t.Fatalf("compact: freshness_at not stripped: %v", c.FreshnessAt)
+	}
+	// Light fields kept.
+	if c.LineageID != n.LineageID || c.Kind != "fact" || c.Summary != "canvas-label" || len(c.Tags) != 1 {
+		t.Fatalf("compact: light fields missing: %+v", c)
+	}
+}

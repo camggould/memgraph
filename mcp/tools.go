@@ -13,18 +13,22 @@ import (
 // --- DTOs (JSON-serialized forms of memgraph types) ---
 
 type nodeOut struct {
-	ID           string         `json:"id"`
-	GraphID      string         `json:"graph_id"`
-	LineageID    string         `json:"lineage_id"`
-	Version      int            `json:"version"`
-	Kind         string         `json:"kind"`
-	Content      string         `json:"content"`
+	ID        string `json:"id"`
+	GraphID   string `json:"graph_id"`
+	LineageID string `json:"lineage_id"`
+	Version   int    `json:"version"`
+	Kind      string `json:"kind"`
+	// Content uses omitempty so compact-mode listings (which zero this field)
+	// don't ship an empty string to clients; full-payload reads still get
+	// it. Real nodes always have non-empty Content in v0.5 semantics, so
+	// emitting "" would be wasteful.
+	Content      string         `json:"content,omitempty"`
 	Summary      string         `json:"summary,omitempty"`
 	Tags         []string       `json:"tags,omitempty"`
 	Metadata     map[string]any `json:"metadata,omitempty"`
 	FreshnessAt  *time.Time     `json:"freshness_at,omitempty"`
 	CreatedAt    time.Time      `json:"created_at"`
-	CreatedBy    string         `json:"created_by"`
+	CreatedBy    string         `json:"created_by,omitempty"`
 	SupersededBy *string        `json:"superseded_by,omitempty"`
 	IsCurrent    bool           `json:"is_current"`
 	IsStale      bool           `json:"is_stale"`
@@ -156,6 +160,20 @@ type getNodeIn struct {
 	LineageID string `json:"lineage_id,omitempty" jsonschema:"lineage id; resolves to current version"`
 	AtVersion *int   `json:"at_version,omitempty" jsonschema:"pin to a specific version (with lineage_id)"`
 	AtTime    string `json:"at_time,omitempty" jsonschema:"RFC3339 point-in-time (with lineage_id)"`
+}
+
+type listNodesIn struct {
+	GraphID string   `json:"graph_id"`
+	Kinds   []string `json:"kinds,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
+	Limit   int      `json:"limit,omitempty" jsonschema:"default 50"`
+	Offset  int      `json:"offset,omitempty"`
+	Compact bool     `json:"compact,omitempty" jsonschema:"if true, omits content/metadata/freshness_at/created_by/superseded_by/conflicts — sparse projection for graph-view rendering"`
+}
+
+type listNodesOut struct {
+	Nodes      []nodeOut `json:"nodes"`
+	NextOffset int       `json:"next_offset"`
 }
 
 type historyIn struct {
@@ -405,6 +423,15 @@ func (s *Server) registerTools(srv *sdkmcp.Server) {
 	}, s.handleGetNode)
 
 	sdkmcp.AddTool(srv, &sdkmcp.Tool{
+		Name: "memgraph_list_nodes",
+		Description: "List current-version nodes in a graph with optional kind/tag/limit/offset filtering. " +
+			"Use compact=true to fetch a sparse projection (id, lineage_id, version, kind, summary, tags, " +
+			"is_current, is_stale, created_at) — drops content/metadata/freshness_at/created_by/" +
+			"superseded_by/conflicts. Useful for graph-view rendering where the canvas only needs " +
+			"labels + colors; clients lazy-load full payloads via memgraph_get_node when needed.",
+	}, s.handleListNodes)
+
+	sdkmcp.AddTool(srv, &sdkmcp.Tool{
 		Name:        "memgraph_history",
 		Description: "Return all versions of a lineage, newest first.",
 	}, s.handleHistory)
@@ -531,6 +558,34 @@ func (s *Server) handleGetNode(ctx context.Context, _ *sdkmcp.CallToolRequest, i
 		return nil, nodeOut{}, err
 	}
 	return nil, toNodeOut(n, opts.AtVersion != nil || opts.AtTime != nil), nil
+}
+
+func (s *Server) handleListNodes(ctx context.Context, _ *sdkmcp.CallToolRequest, in listNodesIn) (*sdkmcp.CallToolResult, listNodesOut, error) {
+	if in.GraphID == "" {
+		return nil, listNodesOut{}, fmt.Errorf("%w: graph_id required", memgraph.ErrInvalidInput)
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	ns, err := s.store.ListNodes(ctx, memgraph.GraphID(in.GraphID), memgraph.NodeFilter{
+		Kinds:   in.Kinds,
+		Tags:    in.Tags,
+		Limit:   limit,
+		Offset:  in.Offset,
+		Compact: in.Compact,
+	})
+	if err != nil {
+		return nil, listNodesOut{}, err
+	}
+	out := listNodesOut{
+		Nodes:      make([]nodeOut, 0, len(ns)),
+		NextOffset: in.Offset + len(ns),
+	}
+	for _, n := range ns {
+		out.Nodes = append(out.Nodes, toNodeOut(n, false))
+	}
+	return nil, out, nil
 }
 
 func (s *Server) handleHistory(ctx context.Context, _ *sdkmcp.CallToolRequest, in historyIn) (*sdkmcp.CallToolResult, historyOut, error) {

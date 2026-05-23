@@ -124,6 +124,15 @@ type NodeFilter struct {
 	Tags   []string
 	Limit  int
 	Offset int
+	// Compact requests a sparse projection: callers that only need to render
+	// a graph view (canvas labels, colors, shape, filters) can skip the heavy
+	// fields. When true, the Store returns Nodes with Content, Metadata,
+	// FreshnessAt, CreatedBy, SupersededBy, and Conflicts cleared. The
+	// remaining fields (ID, GraphID, LineageID, Version, Kind, Summary, Tags,
+	// CreatedAt) plus the computed is_current / is_stale flags downstream
+	// adapters expose are enough to draw the graph. Default false preserves
+	// the v0.5 behavior.
+	Compact bool
 }
 
 // TraverseDirection controls which way edges are followed during a traversal.

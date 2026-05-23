@@ -928,3 +928,76 @@ func TestSubscribe_Graph(t *testing.T) {
 		t.Fatalf("after unsubscribe expected still 2 graph notifications, got %d", got)
 	}
 }
+
+func TestListNodesCompact(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	g := mustCreateGraph(t, s, memgraph.GraphInput{Name: "g"})
+
+	fresh := time.Now().Add(24 * time.Hour)
+	n := mustPutNode(t, s, memgraph.NodeInput{
+		GraphID:     g.ID,
+		Kind:        "fact",
+		Content:     "the heavy payload that compact mode should drop",
+		Summary:     "label-for-canvas",
+		Tags:        []string{"x", "y"},
+		Metadata:    map[string]any{"k": "v"},
+		FreshnessAt: &fresh,
+		CreatedBy:   "tester",
+	})
+
+	// Full mode (default): all fields populated.
+	full, err := s.ListNodes(ctx, g.ID, memgraph.NodeFilter{})
+	if err != nil {
+		t.Fatalf("ListNodes full: %v", err)
+	}
+	if len(full) != 1 {
+		t.Fatalf("full: want 1 node, got %d", len(full))
+	}
+	f := full[0]
+	if f.Content == "" || f.Metadata == nil || f.FreshnessAt == nil || f.CreatedBy == "" {
+		t.Fatalf("full mode: missing heavy fields: content=%q metadata=%v freshness=%v createdBy=%q",
+			f.Content, f.Metadata, f.FreshnessAt, f.CreatedBy)
+	}
+
+	// Compact mode: heavy fields zeroed; light fields kept.
+	compact, err := s.ListNodes(ctx, g.ID, memgraph.NodeFilter{Compact: true})
+	if err != nil {
+		t.Fatalf("ListNodes compact: %v", err)
+	}
+	if len(compact) != 1 {
+		t.Fatalf("compact: want 1 node, got %d", len(compact))
+	}
+	c := compact[0]
+	if c.Content != "" {
+		t.Fatalf("compact: content not stripped: %q", c.Content)
+	}
+	if c.Metadata != nil {
+		t.Fatalf("compact: metadata not stripped: %v", c.Metadata)
+	}
+	if c.FreshnessAt != nil {
+		t.Fatalf("compact: freshness_at not stripped: %v", c.FreshnessAt)
+	}
+	if c.CreatedBy != "" {
+		t.Fatalf("compact: created_by not stripped: %q", c.CreatedBy)
+	}
+	if c.SupersededBy != nil {
+		t.Fatalf("compact: superseded_by not stripped: %v", c.SupersededBy)
+	}
+	if len(c.Conflicts) != 0 {
+		t.Fatalf("compact: conflicts not stripped: %v", c.Conflicts)
+	}
+	// Light fields KEPT — needed to render the canvas + run filters.
+	if c.ID != n.ID || c.LineageID != n.LineageID || c.Version != n.Version {
+		t.Fatalf("compact: identifiers wrong: %+v", c)
+	}
+	if c.Kind != "fact" || c.Summary != "label-for-canvas" {
+		t.Fatalf("compact: kind/summary missing: kind=%q summary=%q", c.Kind, c.Summary)
+	}
+	if len(c.Tags) != 2 || c.Tags[0] != "x" {
+		t.Fatalf("compact: tags missing: %v", c.Tags)
+	}
+	if c.CreatedAt.IsZero() {
+		t.Fatalf("compact: created_at zero")
+	}
+}

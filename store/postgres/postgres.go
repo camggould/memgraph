@@ -688,6 +688,20 @@ func (s *Store) ListNodes(ctx context.Context, graphID memgraph.GraphID, f memgr
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if f.Compact {
+		// Strip heavy fields the canvas doesn't need so the caller can skip a
+		// ~2KB-per-node payload. Conflicts are also dropped, which lets us
+		// skip the per-row populateConflicts query entirely.
+		for i := range out {
+			out[i].Content = ""
+			out[i].Metadata = nil
+			out[i].FreshnessAt = nil
+			out[i].CreatedBy = ""
+			out[i].SupersededBy = nil
+			out[i].Conflicts = nil
+		}
+		return out, nil
+	}
 	for i := range out {
 		if err := s.populateConflicts(ctx, s.pool, &out[i]); err != nil {
 			return nil, err
